@@ -1,0 +1,35 @@
+# FastAPI and ASGI server
+fastapi==0.95.1
+uvicorn==0.22.0
+pydantic==1.10.7
+python-multipart==0.0.6
+python-dotenv==1.0.0
+PyJWT==2.8.0
+
+# Database
+sqlalchemy==2.0.12
+psycopg2-binary==2.9.6
+alembic==1.10.4
+
+# Authentication
+python-jose==3.3.0
+passlib==1.7.4
+bcrypt==4.0.1
+
+# Rate limiting
+redis==4.5.5
+async-timeout==4.0.2
+
+# Kafka
+aiokafka==0.8.1
+
+# Testing
+pytest==7.3.1
+pytest-asyncio==0.21.0
+pytest-cov==4.1.0
+httpx==0.24.1
+
+# Utilities
+asyncio==3.4.3
+tenacity==8.2.2
+json-logging==1.3.0

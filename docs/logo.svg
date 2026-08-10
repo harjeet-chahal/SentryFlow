@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">
+  <!-- Background Circle -->
+  <circle cx="100" cy="100" r="90" fill="#2563EB" />
+  
+  <!-- Inner Circle -->
+  <circle cx="100" cy="100" r="75" fill="#1E40AF" />
+  
+  <!-- Flow Lines -->
+  <path d="M30,100 C50,70 80,60 100,60 C120,60 150,70 170,100" stroke="#60A5FA" stroke-width="6" fill="none" />
+  <path d="M30,100 C50,130 80,140 100,140 C120,140 150,130 170,100" stroke="#60A5FA" stroke-width="6" fill="none" />
+  
+  <!-- Shield Outline -->
+  <path d="M100,30 L135,45 C135,45 140,80 140,110 C140,140 100,170 100,170 C100,170 60,140 60,110 C60,80 65,45 65,45 L100,30 Z" stroke="#BFDBFE" stroke-width="4" fill="none" />
+  
+  <!-- Eye Symbol -->
+  <circle cx="100" cy="90" r="15" fill="#BFDBFE" />
+  <circle cx="100" cy="90" r="7" fill="#1E40AF" />
+  
+  <!-- Pulse Line -->
+  <path d="M70,120 L85,120 L90,105 L100,135 L110,105 L115,120 L130,120" stroke="#BFDBFE" stroke-width="4" fill="none" stroke-linecap="round" />
+</svg>
