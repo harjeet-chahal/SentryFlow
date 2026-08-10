@@ -1,12 +1,5 @@
 # SentryFlow
-
-<div align="center">
-
-![SentryFlow Logo](docs/logo.svg)
-
 **A comprehensive API monitoring and management system**
-
-</div>
 
 ## Overview
 
