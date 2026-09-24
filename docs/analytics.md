@@ -116,7 +116,8 @@ view holding `quantileState` per user, endpoint and minute.
 
 The Dashboard and Rate Limit Monitor refresh every 10 seconds. An event is
 visible about 2–3 seconds after its request: up to 2 seconds in the
-aggregator's batch, plus the insert and the query.
+aggregator's batch, plus the insert and the query. The load test measures this
+([load-testing.md](load-testing.md)).
 
 ## Testing
 

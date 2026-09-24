@@ -1,7 +1,7 @@
 # SentryFlow
 
 .PHONY: help setup test test-backend test-aggregator test-integration test-frontend \
-        lint clean dev-backend dev-frontend dev-aggregator \
+        lint clean dev-backend dev-frontend dev-aggregator loadtest \
         docker-build docker-up docker-down docker-logs docker-ps \
         db-setup clickhouse-setup helm-lint helm-template k8s-validate
 
@@ -71,6 +71,9 @@ docker-logs: ## Tail logs from all services
 
 docker-ps: ## List running containers
 	docker compose ps
+
+loadtest: ## Load-test the running stack with k6 (needs SENTRYFLOW_ADMIN_PASSWORD)
+	docker compose --profile loadtest run --rm loadtest
 
 # --- Data stores ------------------------------------------------------------
 

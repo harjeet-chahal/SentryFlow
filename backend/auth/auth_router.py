@@ -14,6 +14,7 @@ from typing import List, Optional
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
@@ -35,6 +36,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# bcrypt is deliberately slow (~200 ms of CPU). Every call below goes through
+# the threadpool: on the event loop it would stall every in-flight gateway
+# request for the duration of each sign-up and login.
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
@@ -174,7 +178,7 @@ async def signup(user: UserCreate, db: Session = Depends(get_db)):
     db_user = User(
         email=user.email,
         username=user.username,
-        hashed_password=get_password_hash(user.password),
+        hashed_password=await run_in_threadpool(get_password_hash, user.password),
     )
     db.add(db_user)
     db.commit()
@@ -190,7 +194,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = 
     password flow, which is what Swagger's Authorize button and the standard
     client libraries speak.
     """
-    user = authenticate_user(db, form_data.username, form_data.password)
+    user = await run_in_threadpool(authenticate_user, db, form_data.username, form_data.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

@@ -1,4 +1,7 @@
 """Authentication, token handling and API-key lifecycle."""
+import threading
+
+import httpx
 import jwt
 import pytest
 
@@ -246,3 +249,46 @@ def test_revoking_a_missing_key_is_a_404(client, user):
     response = client.delete("/auth/apikeys/does-not-exist", headers=user["headers"])
     assert response.status_code == 404
 
+
+# --------------------------------------------------------------------------
+# Password hashing must not stall the gateway
+# --------------------------------------------------------------------------
+
+def _record_threads(monkeypatch, method):
+    """Wrap a CryptContext method to record which thread runs it."""
+    threads = []
+    real = getattr(auth_router.pwd_context, method)
+
+    def spy(*args, **kwargs):
+        threads.append(threading.get_ident())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(auth_router.pwd_context, method, spy)
+    return threads
+
+
+async def test_login_checks_the_password_off_the_event_loop(app, user, monkeypatch):
+    """bcrypt costs ~200 ms of CPU. Run on the event loop, it stalls every
+    request in flight for that long; the load test showed it as p99 spikes."""
+    threads = _record_threads(monkeypatch, "verify")
+
+    async with httpx.AsyncClient(app=app, base_url="http://gateway") as ac:
+        response = await ac.post(
+            "/auth/login", data={"username": user["username"], "password": user["password"]}
+        )
+
+    assert response.status_code == 200
+    assert threads and threading.get_ident() not in threads
+
+
+async def test_signup_hashes_the_password_off_the_event_loop(app, monkeypatch):
+    threads = _record_threads(monkeypatch, "hash")
+
+    async with httpx.AsyncClient(app=app, base_url="http://gateway") as ac:
+        response = await ac.post(
+            "/auth/signup",
+            json={"username": "hasher", "email": "hasher@example.com", "password": "pw-123456"},
+        )
+
+    assert response.status_code == 201
+    assert threads and threading.get_ident() not in threads

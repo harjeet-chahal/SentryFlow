@@ -41,6 +41,7 @@ limiting so an unauthenticated caller cannot burn another user's budget.
 | Streaming | Kafka (`aiokafka`) |
 | Analytics | ClickHouse; percentiles computed at query time from raw events |
 | Dashboard | React 18, Chart.js, Tailwind; refreshes every 10 s |
+| Load testing | k6 |
 | Orchestration | Kubernetes (Helm), Docker Compose for local |
 | Cloud | AWS — EKS, RDS, ElastiCache, MSK, ECR, ALB |
 
@@ -135,7 +136,7 @@ cd frontend && npm test       # dashboard helpers and pages
 
 | Suite | Tests | Coverage |
 | --- | ---: | ---: |
-| Backend | 250 | **94%** statement and branch (CI floor 90%) |
+| Backend | 252 | **94%** statement and branch (CI floor 90%) |
 | Aggregator | 32 | 99% (CI floor 90%) |
 | Analytics SQL, against real ClickHouse | 11 | — |
 | Frontend | 97 | — |
@@ -157,7 +158,26 @@ token-bucket refill and capping, fail-open and fail-closed on a Redis outage,
 refresh tokens rejected as access tokens, forged and expired tokens, per-user
 data scoping and admin-only writes, limit changes applying on the very next
 request, revocation evicting the cache, Kafka outages not reaching callers,
-and at-least-once commit ordering in the aggregator.
+at-least-once commit ordering in the aggregator, and password hashing staying
+off the event loop.
+
+---
+
+## Performance
+
+k6 against the compose stack, one gateway process, all services on one laptop
+([full results](docs/load-testing.md)):
+
+| Offered load | Requests | p95 | p99 | Failures |
+| ---: | ---: | ---: | ---: | ---: |
+| 200/s for 60 s | 12,001 | 2.3 ms | 2.9 ms | 0 |
+| 1,000/s for 30 s | 30,001 | 1.4 ms | 2.7 ms | 0 |
+| 1,500/s for 30 s | 45,001 | 3.0 ms | 24.9 ms | 0 |
+
+One worker saturates between 1,500 and 2,000 requests/s; the Helm chart's HPA
+scales the gateway from 3 to 12 pods on shared Redis. In every run a caller
+limited to 30/min got exactly 30 responses, and new requests reached the
+analytics API within 2.1 s.
 
 ---
 
@@ -218,6 +238,10 @@ ClickHouse aggregates on read. Percentiles cannot be rebuilt from
 pre-aggregated percentiles, and there are no rollup tables to keep consistent.
 The dashboard's ClickHouse connection is read-only and time-bounded.
 
+**Nothing slow on the event loop.** bcrypt, database lookups and ClickHouse
+queries run in the threadpool. The load test caught bcrypt running inline:
+each login stalled every in-flight request for about 200 ms.
+
 ---
 
 ## Documentation
@@ -225,6 +249,7 @@ The dashboard's ClickHouse connection is read-only and time-bounded.
 - [API reference](docs/api.md)
 - [Rate limiting](docs/rate-limiting.md)
 - [Analytics pipeline](docs/analytics.md)
+- [Load testing](docs/load-testing.md)
 - [Deployment](docs/deployment.md)
 
 ## Licence

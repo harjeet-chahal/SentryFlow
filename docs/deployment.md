@@ -50,7 +50,8 @@ If a host port is taken, move it: `BACKEND_PORT`, `DASHBOARD_PORT`,
 `POSTGRES_PORT`, `REDIS_PORT`, `KAFKA_PORT`, `CLICKHOUSE_HTTP_PORT`,
 `CLICKHOUSE_NATIVE_PORT`, `KAFKA_UI_PORT`.
 
-To run without containers, see the repository README.
+To run without containers, see the repository README. To load-test the stack,
+see [load-testing.md](load-testing.md).
 
 ---
 
