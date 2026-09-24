@@ -39,6 +39,9 @@ aggregator:
     repository: sentryflow-aggregator
   # One replica per partition at most; extra consumers in a group sit idle.
   replicaCount: 2
+  # For topics the aggregator creates itself (see batch_consumer.ensure_topics).
+  topicPartitions: 3
+  topicReplication: 1
   resources:
     requests:
       cpu: 100m

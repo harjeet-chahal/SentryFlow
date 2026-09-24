@@ -17,10 +17,10 @@ runs on EKS with the stateful dependencies moved to managed AWS services.
 ## Local development
 
 Compose brings up the gateway, aggregator, dashboard and every dependency
-(Postgres, Redis, Kafka, ClickHouse):
+(Postgres, Redis, Kafka in KRaft mode, ClickHouse):
 
 ```bash
-docker compose up -d
+SENTRYFLOW_ADMIN_PASSWORD=choose-one docker compose up -d --build
 ```
 
 | Service | URL |
@@ -28,17 +28,27 @@ docker compose up -d
 | Dashboard | http://localhost |
 | Gateway | http://localhost:8000 |
 | API docs | http://localhost:8000/docs |
-| Kafka UI | http://localhost:8080 |
+| Kafka UI | http://localhost:8080, with `--profile tools` |
 
-Seed the schema and an admin account:
+Start-up is ordered by health checks. A one-shot `migrate` service runs
+`python -m backend.setup_db` once Postgres is ready; the gateway starts after it
+succeeds and Kafka is healthy (the gateway opens its Kafka producer once, at
+boot). `setup_db` is idempotent: it creates missing tables, applies additive
+upgrades, creates the `admin` account if absent, and seeds a catch-all rate
+limit. Without `SENTRYFLOW_ADMIN_PASSWORD` it generates a password and prints
+it once: `docker compose logs migrate`.
 
-```bash
-docker compose exec backend python -m backend.setup_db
-```
+The aggregator creates the ClickHouse table and the Kafka topics itself on
+start-up, so a fresh stack needs no manual steps. Events from a request reach
+the dashboard in about 2–3 seconds.
 
-`setup_db` is idempotent: it creates missing tables, creates the admin user if
-absent, and seeds a catch-all rate limit. If `SENTRYFLOW_ADMIN_PASSWORD` is
-unset it generates one and prints it once.
+The dashboard image is built with `REACT_APP_API_URL=""`, so the browser calls
+its own origin, and nginx proxies `/api`, `/auth`, `/health`, `/analytics` and
+`/limits` to the gateway. The ingress routes the same paths in Kubernetes.
+
+If a host port is taken, move it: `BACKEND_PORT`, `DASHBOARD_PORT`,
+`POSTGRES_PORT`, `REDIS_PORT`, `KAFKA_PORT`, `CLICKHOUSE_HTTP_PORT`,
+`CLICKHOUSE_NATIVE_PORT`, `KAFKA_UI_PORT`.
 
 To run without containers, see the repository README.
 
@@ -57,7 +67,9 @@ docker build -t sentryflow-aggregator:$(git rev-parse --short HEAD) ./aggregator
 docker build -t sentryflow-frontend:$(git rev-parse --short HEAD) ./frontend
 ```
 
-The frontend serves from `nginx-unprivileged` on port **8080**, not 80.
+The frontend serves from `nginx-unprivileged` on port **8080**, not 80. Its
+API base URL is baked in at build time (`--build-arg REACT_APP_API_URL=...`);
+the default, empty, means same-origin behind the ingress.
 
 ---
 
@@ -165,6 +177,16 @@ Nothing sensitive belongs in Git or in `--set`. Store the database password,
 JWT signing key and ClickHouse credentials in Secrets Manager and let External
 Secrets Operator project them into a Kubernetes Secret named
 `sentryflow-secrets`; the chart then consumes it via `secrets.existingSecret`.
+The gateway only reads ClickHouse, so give it a user with read access; the
+aggregator needs insert and create on the `sentryflow` database.
+
+#### Kafka topics on MSK
+
+MSK disables topic auto-creation by default. The aggregator creates
+`api-requests` and `rate-limited-events` on start-up if it is allowed to
+(`aggregator.topicPartitions`, `aggregator.topicReplication`: 3 and 3 in
+`values-production.yaml`). If your ACLs forbid that, create them beforehand;
+the aggregator logs a warning and carries on when creation is refused.
 
 The application refuses to start when `ENVIRONMENT=production` and
 `JWT_SECRET` is unset, rather than falling back to a guessable default.
@@ -202,8 +224,20 @@ kubectl -n sentryflow exec deploy/sentryflow-backend -- \
 helm rollback sentryflow --namespace sentryflow
 ```
 
-The migration job only adds tables and seeds absent rows, so rolling the
-application back does not require a schema rollback.
+The migration job only adds tables, columns and indexes and seeds absent
+rows, so rolling the application back does not require a schema rollback.
+
+### Administrators
+
+The migration job creates `admin`. To promote another account:
+
+```bash
+kubectl -n sentryflow exec deploy/sentryflow-backend -- \
+  python -m backend.setup_db --grant-admin alice
+```
+
+An existing account that happens to be named `admin` is never promoted
+automatically: it could have come through public sign-up.
 
 ### Scaling
 

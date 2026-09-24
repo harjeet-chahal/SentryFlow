@@ -7,6 +7,10 @@ COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 
 COPY . .
+# Baked into the bundle at build time. Empty means same-origin: nginx (or the
+# Kubernetes ingress) routes the API paths to the gateway.
+ARG REACT_APP_API_URL=""
+ENV REACT_APP_API_URL=$REACT_APP_API_URL
 RUN npm run build
 
 # Production stage

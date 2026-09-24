@@ -247,6 +247,33 @@ async def get_rate_limit_config(user_id: str, endpoint: str) -> dict:
     return config or default_config()
 
 
+def _escape_glob(value: str) -> str:
+    """Escape Redis MATCH metacharacters so a value is matched literally."""
+    return "".join("\\" + ch if ch in "*?[]\\" else ch for ch in value)
+
+
+async def invalidate_config_cache(user_id: str) -> None:
+    """Forget every cached rule resolution for one user.
+
+    Called when a rule changes, so the new limit applies on the next request
+    rather than up to CONFIG_CACHE_TTL later. It has to clear every endpoint
+    the user has called, not one key: a change to their ``*`` rule alters
+    what each of those endpoints resolves to.
+    """
+    redis_client = get_redis()
+    pattern = f"ratelimit:cfg:{_escape_glob(user_id)}:*"
+    try:
+        keys = [key async for key in redis_client.scan_iter(match=pattern, count=500)]
+        if keys:
+            await redis_client.delete(*keys)
+    except RedisError:
+        logger.warning(
+            "Rate-limit config cache invalidation failed; the change applies within %ss",
+            CONFIG_CACHE_TTL,
+            exc_info=True,
+        )
+
+
 async def check_sliding_window(key: str, window_seconds: int, limit: int) -> RateLimitResult:
     """Allow at most ``limit`` requests in any trailing ``window_seconds``."""
     now_ms = int(time.time() * 1000)

@@ -25,6 +25,9 @@ backend:
 aggregator:
   # Match the partition count of the api-requests topic.
   replicaCount: 3
+  topicPartitions: 3
+  # MSK runs three brokers across three AZs.
+  topicReplication: 3
 
 frontend:
   replicaCount: 3

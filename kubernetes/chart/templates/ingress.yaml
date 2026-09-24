@@ -19,28 +19,18 @@ spec:
     - host: {{ .Values.ingress.host | quote }}
       http:
         paths:
-          # API and auth traffic to the gateway; everything else to the SPA.
-          - path: /api
+          # Gateway and dashboard APIs to the backend; everything else to the
+          # SPA. Prefix matching is per path segment: /limits covers /limits
+          # and /limits/<id>, not /limitsx.
+          {{- range list "/api" "/auth" "/health" "/analytics" "/limits" }}
+          - path: {{ . }}
             pathType: Prefix
             backend:
               service:
-                name: {{ include "sentryflow.fullname" . }}-backend
+                name: {{ include "sentryflow.fullname" $ }}-backend
                 port:
-                  number: {{ .Values.service.backendPort }}
-          - path: /auth
-            pathType: Prefix
-            backend:
-              service:
-                name: {{ include "sentryflow.fullname" . }}-backend
-                port:
-                  number: {{ .Values.service.backendPort }}
-          - path: /health
-            pathType: Prefix
-            backend:
-              service:
-                name: {{ include "sentryflow.fullname" . }}-backend
-                port:
-                  number: {{ .Values.service.backendPort }}
+                  number: {{ $.Values.service.backendPort }}
+          {{- end }}
           - path: /
             pathType: Prefix
             backend:

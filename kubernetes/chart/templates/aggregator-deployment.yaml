@@ -67,6 +67,12 @@ spec:
                 secretKeyRef:
                   name: {{ include "sentryflow.secretName" . }}
                   key: clickhousePassword
+            # Used only if the topics do not exist yet and the broker lets
+            # the aggregator create them.
+            - name: KAFKA_TOPIC_PARTITIONS
+              value: {{ .Values.aggregator.topicPartitions | quote }}
+            - name: KAFKA_TOPIC_REPLICATION
+              value: {{ .Values.aggregator.topicReplication | quote }}
           resources:
             {{- toYaml .Values.aggregator.resources | nindent 12 }}
           volumeMounts:

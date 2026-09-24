@@ -30,6 +30,15 @@ class Settings:
     API_REQUESTS_TOPIC: str = os.getenv("API_REQUESTS_TOPIC", "api-requests")
     RATE_LIMITED_TOPIC: str = os.getenv("RATE_LIMITED_TOPIC", "rate-limited-events")
 
+    # ClickHouse, which the dashboard's analytics endpoints read
+    CLICKHOUSE_HOST: str = os.getenv("CLICKHOUSE_HOST", "localhost")
+    CLICKHOUSE_PORT: int = int(os.getenv("CLICKHOUSE_PORT", "9000"))
+    CLICKHOUSE_USER: str = os.getenv("CLICKHOUSE_USER", "default")
+    CLICKHOUSE_PASSWORD: str = os.getenv("CLICKHOUSE_PASSWORD", "")
+    CLICKHOUSE_DATABASE: str = os.getenv("CLICKHOUSE_DATABASE", "sentryflow")
+    # Upper bound on one dashboard query, enforced by ClickHouse itself.
+    ANALYTICS_QUERY_TIMEOUT: int = int(os.getenv("ANALYTICS_QUERY_TIMEOUT", "10"))
+
     # Auth
     JWT_ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
     ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))

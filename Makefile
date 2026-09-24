@@ -1,7 +1,7 @@
 # SentryFlow
 
-.PHONY: help setup test test-backend test-frontend lint clean \
-        dev-backend dev-frontend dev-aggregator \
+.PHONY: help setup test test-backend test-aggregator test-integration test-frontend \
+        lint clean dev-backend dev-frontend dev-aggregator \
         docker-build docker-up docker-down docker-logs docker-ps \
         db-setup clickhouse-setup helm-lint helm-template k8s-validate
 
@@ -26,14 +26,24 @@ dev-frontend: ## Run the dashboard dev server
 	cd frontend && npm start
 
 dev-aggregator: ## Run the Kafka -> ClickHouse aggregator
-	cd aggregator && python batch_consumer.py
+	python -m aggregator.batch_consumer
 
 # --- Tests ------------------------------------------------------------------
 
-test: test-backend test-frontend ## Run all test suites
+test: test-backend test-aggregator test-frontend ## Run all unit test suites
 
 test-backend: ## Run backend tests with coverage (fails under 90%)
 	cd backend && pytest
+
+test-aggregator: ## Run aggregator tests with coverage (fails under 90%)
+	cd aggregator && pytest
+
+# Needs a ClickHouse, e.g. the compose one: make docker-up first.
+test-integration: ## Run the analytics SQL against a real ClickHouse
+	cd backend && CLICKHOUSE_TEST_HOST=$${CLICKHOUSE_TEST_HOST:-localhost} \
+		CLICKHOUSE_TEST_USER=$${CLICKHOUSE_TEST_USER:-sentryflow} \
+		CLICKHOUSE_TEST_PASSWORD=$${CLICKHOUSE_TEST_PASSWORD:-sentryflow} \
+		pytest tests/integration --no-cov
 
 test-frontend: ## Run frontend tests
 	cd frontend && npm test -- --watchAll=false --passWithNoTests
@@ -50,8 +60,8 @@ lint: ## Lint backend and frontend
 docker-build: ## Build all images
 	docker compose build
 
-docker-up: ## Start the full stack
-	docker compose up -d
+docker-up: ## Build and start the full stack
+	docker compose up -d --build
 
 docker-down: ## Stop the stack
 	docker compose down
@@ -67,8 +77,8 @@ docker-ps: ## List running containers
 db-setup: ## Create tables and seed the admin user (idempotent)
 	python -m backend.setup_db
 
-clickhouse-setup: ## Create ClickHouse tables
-	cd aggregator && python setup_clickhouse.py
+clickhouse-setup: ## Create the ClickHouse table (the aggregator also does this)
+	python -m aggregator.setup_clickhouse
 
 # --- Kubernetes -------------------------------------------------------------
 

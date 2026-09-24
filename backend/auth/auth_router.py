@@ -129,6 +129,35 @@ async def get_current_user(
     return user
 
 
+async def get_current_admin(current_user: User = Depends(get_current_user)) -> User:
+    """Require an administrator.
+
+    A signed-in non-admin gets 403 rather than 401: they are authenticated,
+    and re-authenticating would not change the answer.
+    """
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Administrator role required"
+        )
+    return current_user
+
+
+def scoped_user_id(current_user: User, requested: Optional[str]) -> Optional[str]:
+    """Whose data a request may see. ``None`` means every user's.
+
+    Admins may look at anyone, or at everyone. Other users see only
+    themselves, and naming someone else is refused rather than quietly
+    ignored, so a client bug cannot pass for an empty result.
+    """
+    if current_user.is_admin:
+        return requested or None
+    if requested and requested != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="You can only view your own data"
+        )
+    return current_user.id
+
+
 @router.post("/signup", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def signup(user: UserCreate, db: Session = Depends(get_db)):
     existing = (

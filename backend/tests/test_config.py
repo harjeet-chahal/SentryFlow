@@ -63,3 +63,22 @@ def test_cors_origins_are_split_on_commas(monkeypatch):
     finally:
         monkeypatch.delenv("CORS_ORIGINS", raising=False)
         importlib.reload(config)
+
+
+def test_clickhouse_settings_have_local_defaults():
+    assert config.settings.CLICKHOUSE_PORT == 9000
+    assert config.settings.CLICKHOUSE_DATABASE == "sentryflow"
+    assert config.settings.ANALYTICS_QUERY_TIMEOUT > 0
+
+
+def test_clickhouse_settings_are_read_from_the_environment(monkeypatch):
+    monkeypatch.setenv("CLICKHOUSE_HOST", "clickhouse.internal")
+    monkeypatch.setenv("CLICKHOUSE_PORT", "9440")
+    reloaded = importlib.reload(config)
+    try:
+        assert reloaded.settings.CLICKHOUSE_HOST == "clickhouse.internal"
+        assert reloaded.settings.CLICKHOUSE_PORT == 9440
+    finally:
+        monkeypatch.delenv("CLICKHOUSE_HOST", raising=False)
+        monkeypatch.delenv("CLICKHOUSE_PORT", raising=False)
+        importlib.reload(config)

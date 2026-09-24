@@ -397,3 +397,46 @@ def test_reset_header_is_exposed():
         allowed=True, remaining=7, limit=10, reset_epoch=1700000060
     ).headers
     assert headers["X-RateLimit-Reset"] == "1700000060"
+
+
+# --------------------------------------------------------------------------
+# Cache invalidation when a rule changes
+# --------------------------------------------------------------------------
+
+async def test_invalidation_clears_every_cached_endpoint_for_the_user(fake_redis):
+    for key in ("ratelimit:cfg:u1:/a", "ratelimit:cfg:u1:/b", "ratelimit:cfg:u2:/a"):
+        await fake_redis.set(key, "cached")
+
+    await rate_limiter.invalidate_config_cache("u1")
+
+    assert await fake_redis.get("ratelimit:cfg:u1:/a") is None
+    assert await fake_redis.get("ratelimit:cfg:u1:/b") is None
+    assert await fake_redis.get("ratelimit:cfg:u2:/a") == "cached"
+
+
+async def test_invalidation_matches_the_user_id_literally(fake_redis):
+    """A user id is data, not a glob: "u*" must not clear user "u1"."""
+    await fake_redis.set("ratelimit:cfg:u1:/a", "cached")
+    await fake_redis.set("ratelimit:cfg:u*:/a", "cached")
+
+    await rate_limiter.invalidate_config_cache("u*")
+
+    assert await fake_redis.get("ratelimit:cfg:u1:/a") == "cached"
+    assert await fake_redis.get("ratelimit:cfg:u*:/a") is None
+
+
+async def test_invalidation_with_nothing_cached_is_a_no_op(fake_redis):
+    await rate_limiter.invalidate_config_cache("nobody")
+
+
+async def test_invalidation_survives_a_redis_outage(monkeypatch, caplog):
+    class DownRedis:
+        def scan_iter(self, **kwargs):
+            raise RedisConnectionError("down")
+
+    monkeypatch.setattr(rate_limiter, "get_redis", lambda: DownRedis())
+
+    with caplog.at_level("WARNING"):
+        await rate_limiter.invalidate_config_cache("u1")
+
+    assert "invalidation failed" in caplog.text

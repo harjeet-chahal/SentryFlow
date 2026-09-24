@@ -6,7 +6,7 @@ usage logging in the order the middleware applies them.
 import pytest
 
 from backend.config import settings
-from backend.main import is_public_path
+from backend.main import is_api_key_exempt
 from backend.models.database import SessionLocal
 from backend.models.models import RateLimit
 
@@ -34,15 +34,21 @@ def _set_limit(user_id, rpm, algorithm="sliding_window", burst=10):
 
 @pytest.mark.parametrize(
     "path",
-    ["/health", "/health/ready", "/health/live", "/docs", "/openapi.json", "/auth/login", "/"],
+    [
+        "/health", "/health/ready", "/health/live", "/docs", "/openapi.json", "/auth/login", "/",
+        # Dashboard APIs: JWT-authenticated per route rather than by API key.
+        "/analytics/usage", "/limits", "/limits/some-rule-id",
+    ],
 )
-def test_public_paths_bypass_api_key_enforcement(path):
-    assert is_public_path(path) is True
+def test_exempt_paths_bypass_api_key_enforcement(path):
+    assert is_api_key_exempt(path) is True
 
 
-@pytest.mark.parametrize("path", ["/api/v1/hello", "/api/v1/anything", "/healthz", "/authz"])
-def test_protected_paths_require_a_key(path):
-    assert is_public_path(path) is False
+@pytest.mark.parametrize(
+    "path", ["/api/v1/hello", "/api/v1/anything", "/healthz", "/authz", "/analyticsx", "/limitsx"]
+)
+def test_other_paths_require_a_key(path):
+    assert is_api_key_exempt(path) is False
 
 
 def test_probes_are_reachable_without_credentials(client):
@@ -174,6 +180,49 @@ def test_throttled_requests_are_logged_to_their_own_topic(client, user, api_key,
     throttled = fake_kafka.events_on(settings.RATE_LIMITED_TOPIC)
     assert len(throttled) == 1
     assert throttled[0]["status_code"] == 429
+
+
+class SteppingClock:
+    """perf_counter that advances by a fixed step on every call."""
+
+    def __init__(self, step):
+        self.now, self.step = 100.0, step
+
+    def perf_counter(self):
+        self.now += self.step
+        return self.now
+
+
+def test_response_time_covers_the_whole_gateway_path(client, api_key, fake_kafka, monkeypatch):
+    import backend.main as gateway
+
+    # Two readings: on arrival and once the handler has answered.
+    monkeypatch.setattr(gateway, "time", SteppingClock(step=0.0034))
+    client.get("/api/v1/hello", headers={"x-api-key": api_key["key"]})
+
+    assert fake_kafka.events_on(settings.API_REQUESTS_TOPIC)[0]["response_time"] == 3
+
+
+def test_sub_millisecond_requests_round_rather_than_truncate(client, api_key, fake_kafka, monkeypatch):
+    import backend.main as gateway
+
+    monkeypatch.setattr(gateway, "time", SteppingClock(step=0.0006))
+    client.get("/api/v1/hello", headers={"x-api-key": api_key["key"]})
+
+    assert fake_kafka.events_on(settings.API_REQUESTS_TOPIC)[0]["response_time"] == 1
+
+
+def test_throttled_requests_record_their_real_time(client, user, api_key, fake_kafka, monkeypatch):
+    import backend.main as gateway
+
+    _set_limit(user["id"], rpm=1)
+    headers = {"x-api-key": api_key["key"]}
+    client.get("/api/v1/hello", headers=headers)
+
+    monkeypatch.setattr(gateway, "time", SteppingClock(step=0.002))
+    client.get("/api/v1/hello", headers=headers)
+
+    assert fake_kafka.events_on(settings.RATE_LIMITED_TOPIC)[0]["response_time"] == 2
 
 
 def test_events_are_partitioned_by_user(client, api_key, fake_kafka, user):

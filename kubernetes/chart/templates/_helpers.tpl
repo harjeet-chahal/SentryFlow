@@ -84,6 +84,32 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
   value: "postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@{{ .Values.externalServices.postgresHost }}:{{ .Values.externalServices.postgresPort }}/{{ .Values.externalServices.postgresDatabase }}"
 - name: REDIS_URL
   value: "redis://{{ .Values.externalServices.redisHost }}:{{ .Values.externalServices.redisPort }}/0"
+# ClickHouse backs the dashboard's analytics endpoints (read-only).
+- name: CLICKHOUSE_HOST
+  valueFrom:
+    configMapKeyRef:
+      name: {{ include "sentryflow.fullname" . }}-config
+      key: clickhouseHost
+- name: CLICKHOUSE_PORT
+  valueFrom:
+    configMapKeyRef:
+      name: {{ include "sentryflow.fullname" . }}-config
+      key: clickhousePort
+- name: CLICKHOUSE_DATABASE
+  valueFrom:
+    configMapKeyRef:
+      name: {{ include "sentryflow.fullname" . }}-config
+      key: clickhouseDatabase
+- name: CLICKHOUSE_USER
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "sentryflow.secretName" . }}
+      key: clickhouseUser
+- name: CLICKHOUSE_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "sentryflow.secretName" . }}
+      key: clickhousePassword
 {{- range $key, $value := dict "LOG_LEVEL" "logLevel" "CORS_ORIGINS" "corsOrigins" "DEFAULT_RATE_LIMIT" "defaultRateLimit" "DEFAULT_RATE_LIMIT_WINDOW" "defaultRateLimitWindow" "DEFAULT_RATE_LIMIT_ALGORITHM" "defaultRateLimitAlgorithm" "DEFAULT_BURST_CAPACITY" "defaultBurstCapacity" "RATE_LIMIT_FAIL_OPEN" "rateLimitFailOpen" "ACCESS_TOKEN_EXPIRE_MINUTES" "accessTokenExpireMinutes" "REFRESH_TOKEN_EXPIRE_DAYS" "refreshTokenExpireDays" }}
 - name: {{ $key }}
   valueFrom:

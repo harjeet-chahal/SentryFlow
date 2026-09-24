@@ -172,6 +172,20 @@ def test_me_returns_the_authenticated_user(client, user):
     response = client.get("/auth/me", headers=user["headers"])
     assert response.status_code == 200
     assert response.json()["username"] == user["username"]
+    assert response.json()["is_admin"] is False
+
+
+def test_me_reports_the_admin_role(client, admin):
+    assert client.get("/auth/me", headers=admin["headers"]).json()["is_admin"] is True
+
+
+def test_signup_cannot_grant_the_admin_role(client):
+    response = client.post(
+        "/auth/signup",
+        json={"username": "sneaky", "email": "s@example.com", "password": "pw-123456", "is_admin": True},
+    )
+    assert response.status_code == 201
+    assert response.json()["is_admin"] is False
 
 
 def test_me_requires_a_token(client):
@@ -231,3 +245,4 @@ def test_cannot_revoke_someone_elses_key(client, user_factory, api_key):
 def test_revoking_a_missing_key_is_a_404(client, user):
     response = client.delete("/auth/apikeys/does-not-exist", headers=user["headers"])
     assert response.status_code == 404
+

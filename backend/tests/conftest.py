@@ -1,12 +1,16 @@
 """Shared test fixtures.
 
-The gateway depends on Postgres, Redis and Kafka. Tests substitute all three
-with in-process equivalents so the suite runs with no services:
+The gateway depends on Postgres, Redis, Kafka and ClickHouse. Tests
+substitute all four with in-process equivalents so the suite runs with no
+services:
 
-    Postgres -> a per-test SQLite file
-    Redis    -> fakeredis, which executes the real Lua scripts rather than
-                stubbing them, so the limiter logic is genuinely covered
-    Kafka    -> a recording double that captures produced events
+    Postgres   -> a per-test SQLite file
+    Redis      -> fakeredis, which executes the real Lua scripts rather than
+                  stubbing them, so the limiter logic is genuinely covered
+    Kafka      -> a recording double that captures produced events
+    ClickHouse -> a double that returns canned rows per named query. The SQL
+                  itself is exercised against a real ClickHouse by
+                  tests/integration, which CI runs with a service container.
 
 These are set before any ``backend`` import, because configuration is read
 from the environment at module import time.
@@ -25,6 +29,8 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from backend import redis_client  # noqa: E402
+from backend.analytics import clickhouse  # noqa: E402
+from backend.analytics.clickhouse import AnalyticsUnavailable  # noqa: E402
 from backend.limiter import rate_limiter  # noqa: E402
 from backend.middlewares import logging_middleware  # noqa: E402
 from backend.models import database, models  # noqa: E402
@@ -48,6 +54,29 @@ class RecordingProducer:
 
     def events_on(self, topic):
         return [m["value"] for m in self.sent if m["topic"] == topic]
+
+
+class FakeClickHouse:
+    """Stands in for ClickHouse: canned rows per named query, calls recorded."""
+
+    def __init__(self):
+        self.results = {}
+        self.calls = []
+        self.down = False
+
+    def __call__(self, name, sql, params):
+        if self.down:
+            raise AnalyticsUnavailable("connection refused")
+        self.calls.append({"name": name, "sql": sql, "params": params})
+        return self.results.get(name, [])
+
+    def call(self, name):
+        matches = [c for c in self.calls if c["name"] == name]
+        assert matches, f"query {name!r} was not run; ran {[c['name'] for c in self.calls]}"
+        return matches[-1]
+
+    def names(self):
+        return [c["name"] for c in self.calls]
 
 
 @pytest.fixture(autouse=True)
@@ -78,6 +107,15 @@ def fake_kafka():
     logging_middleware.set_producer(producer)
     yield producer
     logging_middleware.set_producer(None)
+
+
+@pytest.fixture(autouse=True)
+def fake_clickhouse():
+    """Answer analytics queries from canned rows; never reach a real server."""
+    fake = FakeClickHouse()
+    clickhouse.set_executor(fake)
+    yield fake
+    clickhouse.set_executor(None)
 
 
 @pytest.fixture
@@ -133,6 +171,19 @@ def user_factory(client):
 @pytest.fixture
 def user(user_factory):
     return user_factory()
+
+
+@pytest.fixture
+def admin(user_factory):
+    """An operator account. Nobody can sign up as one, so grant it directly."""
+    account = user_factory(username="operator")
+    db = database.SessionLocal()
+    try:
+        db.query(models.User).filter(models.User.id == account["id"]).update({"is_admin": True})
+        db.commit()
+    finally:
+        db.close()
+    return account
 
 
 @pytest.fixture

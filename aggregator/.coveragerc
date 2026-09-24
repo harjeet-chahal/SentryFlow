@@ -1,0 +1,13 @@
+[run]
+source = aggregator
+branch = True
+omit =
+    */tests/*
+    */__init__.py
+
+[report]
+exclude_also =
+    if __name__ == .__main__.:
+show_missing = True
+precision = 1
+fail_under = 90
