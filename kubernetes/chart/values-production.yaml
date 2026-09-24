@@ -1,0 +1,71 @@
+# Production overrides for EKS.
+#
+#   helm upgrade --install sentryflow ./kubernetes/chart \
+#     -f ./kubernetes/chart/values-production.yaml \
+#     --set image.tag=$GIT_SHA
+
+image:
+  registry: 123456789012.dkr.ecr.us-east-1.amazonaws.com
+  pullPolicy: IfNotPresent
+
+backend:
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 65
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 768Mi
+
+aggregator:
+  # Match the partition count of the api-requests topic.
+  replicaCount: 3
+
+frontend:
+  replicaCount: 3
+
+serviceAccount:
+  create: true
+  annotations:
+    # IRSA: pods assume this role instead of holding static credentials.
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/sentryflow-app
+
+ingress:
+  enabled: true
+  className: alb
+  host: api.sentryflow.example.com
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:123456789012:certificate/REPLACE
+    alb.ingress.kubernetes.io/healthcheck-path: /health/live
+
+config:
+  environment: production
+  logLevel: INFO
+  corsOrigins: "https://sentryflow.example.com"
+
+# Managed services rather than in-cluster stateful sets.
+externalServices:
+  postgresHost: sentryflow.abcdefg.us-east-1.rds.amazonaws.com
+  postgresPort: "5432"
+  postgresDatabase: sentryflow
+  redisHost: sentryflow.abcdef.ng.0001.use1.cache.amazonaws.com
+  redisPort: "6379"
+  kafkaBootstrapServers: b-1.sentryflow.abcdef.c2.kafka.us-east-1.amazonaws.com:9092
+  clickhouseHost: clickhouse.sentryflow.internal
+  clickhousePort: "9000"
+  clickhouseDatabase: sentryflow
+
+# Secrets come from AWS Secrets Manager via External Secrets Operator, which
+# projects them into this Kubernetes Secret. Nothing sensitive is in Git.
+secrets:
+  create: false
+  existingSecret: sentryflow-secrets

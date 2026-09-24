@@ -1,0 +1,51 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "sentryflow.fullname" . }}
+  labels:
+    {{- include "sentryflow.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          # API and auth traffic to the gateway; everything else to the SPA.
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "sentryflow.fullname" . }}-backend
+                port:
+                  number: {{ .Values.service.backendPort }}
+          - path: /auth
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "sentryflow.fullname" . }}-backend
+                port:
+                  number: {{ .Values.service.backendPort }}
+          - path: /health
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "sentryflow.fullname" . }}-backend
+                port:
+                  number: {{ .Values.service.backendPort }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "sentryflow.fullname" . }}-frontend
+                port:
+                  number: {{ .Values.service.frontendPort }}
+{{- end }}

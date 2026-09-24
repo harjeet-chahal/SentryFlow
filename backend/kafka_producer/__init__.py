@@ -1,1 +1,0 @@
-# This file makes the kafka_producer directory a Python package

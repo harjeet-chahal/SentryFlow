@@ -1,409 +1,155 @@
-# SentryFlow API Documentation
+# API reference
 
-This document provides a comprehensive guide to the SentryFlow API endpoints, authentication methods, and usage examples.
+Base URL: `http://localhost:8000`. Interactive docs are served at `/docs`.
 
-## Base URL
+## Two credentials
 
-All API endpoints are relative to the base URL:
+| | Used by | Header | Obtained from |
+| --- | --- | --- | --- |
+| **JWT** | the dashboard, a human | `Authorization: Bearer <token>` | `POST /auth/login` |
+| **API key** | machine callers, through the gateway | `x-api-key: <key>` | `POST /auth/apikeys/create` |
 
-```
-http://your-sentryflow-instance/api/v1
-```
+They are not interchangeable. A JWT manages the account; an API key is what
+the rate limiter meters. Tokens carry a `type` claim, so a refresh token is
+rejected wherever an access token is required.
+
+---
 
 ## Authentication
 
-SentryFlow uses API key authentication. Include your API key in the request header:
-
-```
-X-API-Key: your_api_key_here
-```
-
-Alternatively, you can use Bearer token authentication:
-
-```
-Authorization: Bearer your_jwt_token_here
-```
-
-## Rate Limiting
-
-All API endpoints are subject to rate limiting. The default rate limits are:
-
-- 100 requests per minute per API key
-- 1000 requests per hour per API key
-
-When a rate limit is exceeded, the API will return a `429 Too Many Requests` response with a `Retry-After` header indicating when you can retry the request.
-
-## API Endpoints
-
-### Authentication
-
-#### Register a new user
-
-```
-POST /auth/register
-```
-
-**Request Body:**
+### `POST /auth/signup`
 
 ```json
-{
-  "username": "example_user",
-  "email": "user@example.com",
-  "password": "secure_password",
-  "full_name": "Example User"
-}
+{ "username": "demo", "email": "demo@example.com", "password": "demo-password" }
 ```
 
-**Response:**
+`201` with the created user. `400` if the username or email is taken, `422`
+if the email is malformed.
+
+### `POST /auth/login`
+
+**Form-encoded**, not JSON — this is the OAuth2 password flow, which is what
+Swagger's Authorize button and standard client libraries speak.
+
+```bash
+curl -X POST localhost:8000/auth/login \
+  -d 'username=demo&password=demo-password'
+```
 
 ```json
-{
-  "id": "user_uuid",
-  "username": "example_user",
-  "email": "user@example.com",
-  "full_name": "Example User",
-  "created_at": "2023-01-01T00:00:00Z"
-}
+{ "access_token": "...", "refresh_token": "...", "token_type": "bearer" }
 ```
 
-#### Login
+Access tokens expire after `ACCESS_TOKEN_EXPIRE_MINUTES` (default 30);
+refresh tokens after `REFRESH_TOKEN_EXPIRE_DAYS` (default 7). `401` on bad
+credentials.
 
-```
-POST /auth/login
-```
-
-**Request Body:**
+### `POST /auth/refresh`
 
 ```json
-{
-  "username": "example_user",
-  "password": "secure_password"
-}
+{ "refresh_token": "..." }
 ```
 
-**Response:**
+Returns a new pair. `401` if the token is invalid, expired, or an access
+token rather than a refresh token.
+
+### `GET /auth/me`
+
+Requires a bearer token. Returns the authenticated user.
+
+---
+
+## API keys
+
+All require `Authorization: Bearer <access_token>`.
+
+### `POST /auth/apikeys/create`
 
 ```json
-{
-  "access_token": "jwt_token_here",
-  "token_type": "bearer",
-  "expires_in": 3600,
-  "user": {
-    "id": "user_uuid",
-    "username": "example_user",
-    "email": "user@example.com"
-  }
-}
+{ "name": "ci-pipeline" }
 ```
 
-### API Keys
+`201` with the key. The value is 32 bytes of hex entropy and is returned in
+full on every read, so treat it as a secret.
 
-#### Create API Key
+### `GET /auth/apikeys`
 
+Lists the caller's own keys. Never returns another user's.
+
+### `DELETE /auth/apikeys/{api_key_id}`
+
+`204` on success, `404` if the key does not exist or belongs to someone else.
+
+Revocation deactivates the row **and** evicts the gateway's cache. Keys are
+cached for `API_KEY_CACHE_TTL` (default 1h), so deactivating alone would
+leave a revoked key working until the TTL lapsed.
+
+---
+
+## Gateway
+
+Any path that is not under `/auth`, `/health`, or the docs requires an API
+key and is rate limited.
+
+### `GET /api/v1/hello`
+
+A minimal protected endpoint used to exercise the gateway path.
+
+```bash
+curl -i localhost:8000/api/v1/hello -H "x-api-key: $KEY"
 ```
-POST /api-keys
-```
 
-**Request Body:**
+### Response headers
+
+| Header | Meaning |
+| --- | --- |
+| `X-RateLimit-Limit` | ceiling for this caller and endpoint |
+| `X-RateLimit-Remaining` | requests left in the current window |
+| `X-RateLimit-Reset` | Unix time at which full quota returns |
+| `Retry-After` | seconds to wait; sent only on `429` |
+
+While the limiter is degraded (Redis unreachable) the `X-RateLimit-*` headers
+are omitted rather than reported as zero — zero would read as "no quota"
+rather than "not enforced".
+
+### Errors
+
+| Status | Cause |
+| --- | --- |
+| `401` | missing, unknown or revoked API key |
+| `429` | rate limit exceeded |
 
 ```json
-{
-  "name": "My Application",
-  "expires_at": "2024-01-01T00:00:00Z",  // Optional
-  "permissions": ["read", "write"]      // Optional
-}
+{ "detail": "Rate limit exceeded." }
 ```
 
-**Response:**
+---
 
-```json
-{
-  "id": "api_key_uuid",
-  "key": "sk_live_xxxxxxxxxxxxxxxxxxxx",  // Only shown once
-  "name": "My Application",
-  "created_at": "2023-01-01T00:00:00Z",
-  "expires_at": "2024-01-01T00:00:00Z",
-  "permissions": ["read", "write"],
-  "last_used_at": null
-}
-```
+## Health
 
-#### List API Keys
+Unauthenticated, because Kubernetes probes cannot present credentials.
 
-```
-GET /api-keys
-```
+| Endpoint | Purpose | Checks |
+| --- | --- | --- |
+| `GET /health/live` | liveness probe | nothing |
+| `GET /health/ready` | readiness probe | Postgres, Redis |
+| `GET /health` | operator detail | Postgres, Redis, Kafka, with timings |
 
-**Response:**
+`/health/ready` returns `503` when a critical dependency is down. `/health`
+returns `degraded` (still `200`) when only Kafka is unavailable, because
+usage logging is fire-and-forget and the gateway still serves traffic.
 
-```json
-{
-  "items": [
-    {
-      "id": "api_key_uuid",
-      "name": "My Application",
-      "created_at": "2023-01-01T00:00:00Z",
-      "expires_at": "2024-01-01T00:00:00Z",
-      "permissions": ["read", "write"],
-      "last_used_at": "2023-01-02T00:00:00Z"
-    }
-  ],
-  "total": 1,
-  "page": 1,
-  "size": 10
-}
-```
+See [deployment](deployment.md#probes) for why the three differ.
 
-#### Revoke API Key
+---
 
-```
-DELETE /api-keys/{api_key_id}
-```
+## Not yet implemented
 
-**Response:**
+The dashboard currently renders generated data for these views; the endpoints
+are specified but not built:
 
-```json
-{
-  "success": true,
-  "message": "API key revoked successfully"
-}
-```
-
-### Rate Limits
-
-#### Get Rate Limit Configuration
-
-```
-GET /rate-limits
-```
-
-**Response:**
-
-```json
-{
-  "global": {
-    "requests_per_minute": 100,
-    "requests_per_hour": 1000
-  },
-  "endpoints": {
-    "/api/v1/data": {
-      "requests_per_minute": 50,
-      "requests_per_hour": 500
-    }
-  }
-}
-```
-
-#### Update Rate Limit Configuration
-
-```
-PUT /rate-limits
-```
-
-**Request Body:**
-
-```json
-{
-  "global": {
-    "requests_per_minute": 200,
-    "requests_per_hour": 2000
-  },
-  "endpoints": {
-    "/api/v1/data": {
-      "requests_per_minute": 100,
-      "requests_per_hour": 1000
-    }
-  }
-}
-```
-
-**Response:**
-
-```json
-{
-  "success": true,
-  "message": "Rate limit configuration updated successfully"
-}
-```
-
-### Analytics
-
-#### Get API Usage Metrics
-
-```
-GET /analytics/usage
-```
-
-**Query Parameters:**
-
-- `start_date`: Start date in ISO format (required)
-- `end_date`: End date in ISO format (required)
-- `interval`: Aggregation interval (minute, hour, day, week, month)
-- `endpoint`: Filter by specific endpoint
-- `user_id`: Filter by specific user
-
-**Response:**
-
-```json
-{
-  "total_requests": 12500,
-  "success_rate": 98.5,
-  "average_response_time": 120,
-  "data_points": [
-    {
-      "timestamp": "2023-01-01T00:00:00Z",
-      "requests": 500,
-      "success_count": 490,
-      "error_count": 10,
-      "average_response_time": 115
-    },
-    // More data points...
-  ]
-}
-```
-
-#### Get Rate Limit Events
-
-```
-GET /analytics/rate-limits
-```
-
-**Query Parameters:**
-
-- `start_date`: Start date in ISO format (required)
-- `end_date`: End date in ISO format (required)
-- `user_id`: Filter by specific user
-- `api_key_id`: Filter by specific API key
-
-**Response:**
-
-```json
-{
-  "total_events": 250,
-  "events": [
-    {
-      "timestamp": "2023-01-01T12:30:45Z",
-      "user_id": "user_uuid",
-      "api_key_id": "api_key_uuid",
-      "endpoint": "/api/v1/data",
-      "limit_type": "requests_per_minute",
-      "limit_value": 100,
-      "current_usage": 101
-    },
-    // More events...
-  ]
-}
-```
-
-## Error Handling
-
-SentryFlow API uses standard HTTP status codes to indicate the success or failure of an API request.
-
-### Common Status Codes
-
-- `200 OK`: The request was successful
-- `201 Created`: The resource was successfully created
-- `400 Bad Request`: The request was invalid or cannot be served
-- `401 Unauthorized`: Authentication failed or user doesn't have permissions
-- `403 Forbidden`: The request is valid but the user doesn't have permissions
-- `404 Not Found`: The requested resource could not be found
-- `429 Too Many Requests`: Rate limit exceeded
-- `500 Internal Server Error`: An error occurred on the server
-
-### Error Response Format
-
-```json
-{
-  "error": {
-    "code": "rate_limit_exceeded",
-    "message": "You have exceeded the rate limit for this endpoint",
-    "details": {
-      "limit": 100,
-      "current": 101,
-      "reset_at": "2023-01-01T12:31:45Z"
-    }
-  }
-}
-```
-
-## Webhooks
-
-SentryFlow can send webhook notifications for various events:
-
-### Configure Webhooks
-
-```
-POST /webhooks
-```
-
-**Request Body:**
-
-```json
-{
-  "url": "https://your-server.com/webhook",
-  "secret": "your_webhook_secret",
-  "events": ["rate_limit.exceeded", "api_key.created", "api_key.revoked"]
-}
-```
-
-**Response:**
-
-```json
-{
-  "id": "webhook_uuid",
-  "url": "https://your-server.com/webhook",
-  "events": ["rate_limit.exceeded", "api_key.created", "api_key.revoked"],
-  "created_at": "2023-01-01T00:00:00Z",
-  "active": true
-}
-```
-
-### Webhook Payload Example
-
-```json
-{
-  "event": "rate_limit.exceeded",
-  "created_at": "2023-01-01T12:30:45Z",
-  "data": {
-    "user_id": "user_uuid",
-    "api_key_id": "api_key_uuid",
-    "endpoint": "/api/v1/data",
-    "limit_type": "requests_per_minute",
-    "limit_value": 100,
-    "current_usage": 101
-  }
-}
-```
-
-## SDKs and Client Libraries
-
-SentryFlow provides official client libraries for various programming languages:
-
-- [Python SDK](https://github.com/yourusername/sentryflow-python)
-- [JavaScript SDK](https://github.com/yourusername/sentryflow-js)
-- [Go SDK](https://github.com/yourusername/sentryflow-go)
-- [Java SDK](https://github.com/yourusername/sentryflow-java)
-
-## Rate Limiting Algorithms
-
-SentryFlow supports two rate limiting algorithms:
-
-### Sliding Window
-
-The sliding window algorithm tracks requests over a rolling time window. This provides more accurate rate limiting but requires more memory.
-
-### Token Bucket
-
-The token bucket algorithm uses a bucket of tokens that refills at a constant rate. Each request consumes a token, and requests are rejected when the bucket is empty. This is more memory-efficient but less precise.
-
-## Best Practices
-
-1. **Store API keys securely**: Never expose API keys in client-side code or public repositories.
-
-2. **Implement retry logic**: When receiving a 429 response, implement exponential backoff with jitter.
-
-3. **Use webhooks for monitoring**: Set up webhooks to be notified of rate limit events and other important occurrences.
-
-4. **Implement proper error handling**: Always check for error responses and handle them appropriately.
-
-5. **Monitor your usage**: Regularly check your API usage metrics to optimize your implementation.
+- `GET /analytics/usage` — request counts, latency percentiles, error rates
+- `GET /analytics/rate-limits` — throttling by user and endpoint
+- `GET /rate-limits`, `PUT /rate-limits` — manage limits from the dashboard
+  (limits are read from the `rate_limits` table today, so this is CRUD over
+  an existing model)

@@ -27,6 +27,10 @@ class TokenResponse(BaseModel):
     token_type: str
 
 
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
 class ApiKeyBase(BaseModel):
     name: str = Field(..., description="A friendly name for the API key")
 

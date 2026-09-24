@@ -110,20 +110,12 @@ When a rate limit is exceeded, SentryFlow returns a standard `429 Too Many Reque
 HTTP/1.1 429 Too Many Requests
 Content-Type: application/json
 Retry-After: 30
-X-RateLimit-Limit: 100
+X-RateLimit-Limit: 60
 X-RateLimit-Remaining: 0
 X-RateLimit-Reset: 1609459200
 
 {
-  "error": {
-    "code": "rate_limit_exceeded",
-    "message": "You have exceeded the rate limit for this endpoint",
-    "details": {
-      "limit": 100,
-      "current": 101,
-      "reset_at": "2023-01-01T12:31:45Z"
-    }
-  }
+  "detail": "Rate limit exceeded."
 }
 ```
 
@@ -136,37 +128,34 @@ X-RateLimit-Reset: 1609459200
 
 ## Configuring Rate Limits
 
-### Via Dashboard
+### Via the dashboard
 
-1. Log in to the SentryFlow dashboard
-2. Navigate to **Settings** > **Rate Limits**
-3. Configure global, endpoint-specific, or user-based rate limits
-4. Click **Save Changes**
+The **Rate Limit Monitor** page visualises throttling by user and endpoint.
+It currently renders generated data, pending the analytics endpoints listed
+in [the API reference](api.md#not-yet-implemented).
 
-### Via API
+### Via the database
 
-Rate limits can also be configured programmatically via the API:
+Limits live in the `rate_limits` table, one row per user and endpoint:
 
-```
-PUT /api/v1/rate-limits
-Content-Type: application/json
-Authorization: Bearer your_jwt_token_here
+| Column | Meaning |
+| --- | --- |
+| `user_id` | the caller the limit applies to |
+| `endpoint` | an exact path, or `*` as a per-user catch-all |
+| `requests_per_minute` | the ceiling |
+| `burst_capacity` | bucket size, token bucket only |
+| `algorithm` | `sliding_window` or `token_bucket` |
 
-{
-  "global": {
-    "requests_per_minute": 200,
-    "requests_per_hour": 2000,
-    "algorithm": "sliding_window"
-  },
-  "endpoints": {
-    "/api/v1/data": {
-      "requests_per_minute": 100,
-      "requests_per_hour": 1000,
-      "algorithm": "token_bucket"
-    }
-  }
-}
-```
+Resolution order is exact endpoint, then the user's `*` row, then the global
+defaults from the environment. The result is cached in Redis for 60 seconds,
+so a change takes effect within a minute without putting the database in the
+per-request path.
+
+`python -m backend.setup_db` seeds a `*` row for the admin user.
+
+> A management endpoint (`PUT /rate-limits`) is specified in
+> [the API reference](api.md#not-yet-implemented) but not yet built; limits
+> are configured directly in the table today.
 
 ## Monitoring Rate Limits
 
