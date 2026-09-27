@@ -105,6 +105,8 @@ config:
   rateLimitFailOpen: "true"
   accessTokenExpireMinutes: "30"
   refreshTokenExpireDays: "7"
+  # Also how long a key's revocation is remembered.
+  gatewayTokenExpireMinutes: "15"
 
 # Managed endpoints. In production these point at RDS, ElastiCache and MSK.
 externalServices:

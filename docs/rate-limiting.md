@@ -1,7 +1,7 @@
 # Rate limiting
 
-The limiter runs on every gateway request, after the API key has been resolved
-to a user and before the handler runs. It limits each user on each endpoint
+The limiter runs on every gateway request, after the caller's token has been
+verified and before the handler runs. It limits each user on each endpoint
 (request path) separately. All state lives in Redis, which every gateway
 replica shares, so a limit holds across the whole fleet rather than per pod.
 
@@ -197,9 +197,9 @@ import time
 import requests
 
 
-def get_with_retry(url, api_key, attempts=5):
+def get_with_retry(url, token, attempts=5):
     for _ in range(attempts):
-        response = requests.get(url, headers={"x-api-key": api_key})
+        response = requests.get(url, headers={"Authorization": f"Bearer {token}"})
         if response.status_code != 429:
             return response
         time.sleep(int(response.headers.get("Retry-After", "1")))
@@ -215,7 +215,8 @@ def get_with_retry(url, api_key, attempts=5):
 | `rate:sliding_window:{user}:{endpoint}` | sorted set | one member per admitted request | one window after the last admitted request |
 | `rate:token_bucket:{user}:{endpoint}` | hash | `tokens`, `last_refill_ms` | twice the time to refill from empty, at least 60 s |
 | `ratelimit:cfg:{user}:{endpoint}` | string | the resolved rule, or a marker meaning "use the defaults" | 60 s |
-| `apikey:{key}` | string | the key's user, or a marker meaning "no such key" | 1 hour; 60 s for unknown keys |
+| `apikey:{key}` | string | a marker meaning "no such key", so a client retrying with a bad key does not reach Postgres | 60 s |
+| `apikey:revoked:{key_id}` | string | marks a revoked key, whose gateway tokens are refused | the token lifetime plus 60 s |
 
 The algorithm is part of the counter's key, so switching a user to the other
 algorithm starts them with fresh state instead of misreading the old one.
@@ -233,8 +234,9 @@ Either way, the `X-RateLimit-*` headers are left out of the response. A
 limit of `0` would read as "you have no quota", and clients throttle
 themselves on these headers, when the truth is that nothing was enforced.
 
-Authentication never fails open. If Redis cannot answer, API keys are looked
-up in the database on every request: slower, but still correct.
+Authentication never fails open. If Redis cannot answer the revocation
+check, the gateway asks the database whether the token's key is still active,
+on every request: slower, but still correct.
 
 ---
 

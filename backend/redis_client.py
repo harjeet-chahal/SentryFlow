@@ -1,6 +1,7 @@
 """Single shared async Redis client.
 
-Both the rate limiter and the API-key cache talk to Redis on every request.
+Both the rate limiter and the token revocation check talk to Redis on every
+request.
 Routing them through one lazily-created ``redis.asyncio`` client means one
 connection pool per process, no blocking socket I/O on the event loop, and
 one place for tests to substitute a fake.

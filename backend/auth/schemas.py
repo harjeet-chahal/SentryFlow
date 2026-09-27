@@ -40,6 +40,13 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 
 
+class GatewayTokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+    # Seconds until the token expires, as in OAuth 2.0 (RFC 6749, 5.1).
+    expires_in: int
+
+
 class ApiKeyBase(BaseModel):
     name: str = Field(..., description="A friendly name for the API key")
 

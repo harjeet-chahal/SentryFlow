@@ -241,7 +241,7 @@ const LogsExplorer = () => {
                       </span>
                     </td>
                     <td className="px-4 py-4 whitespace-nowrap text-sm font-medium">
-                      {/* Gateway time. For a 429 that is the key lookup and limit check. */}
+                      {/* Gateway time. For a 429 that is the token check and limit check. */}
                       <span className={getResponseTimeClass(log.response_time_ms)}>
                         {formatNumber(log.response_time_ms)} ms
                       </span>

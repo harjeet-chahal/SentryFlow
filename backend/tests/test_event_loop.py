@@ -14,8 +14,11 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import event
 
+from backend import redis_client
+from backend.limiter import rate_limiter
 from backend.models import database
 
 NOW = 1_727_190_000
@@ -44,13 +47,16 @@ def queries_on_loop():
 
 
 @pytest.fixture
-def accounts(client, user, admin, api_key, fake_clickhouse):
-    """A user with a key and a rate-limit rule, and analytics that name them."""
+def accounts(client, user, admin, api_key, gateway_headers, fake_clickhouse):
+    """A user with a key, its gateway token and a rate-limit rule, and
+    analytics that name them."""
     fake_clickhouse.results["throttled_by_user"] = [(user["id"], 10, 5)]
     fake_clickhouse.results["logs"] = [(NOW, user["id"], "/api/v1/hello", 200, 3)]
     fake_clickhouse.results["top_users"] = [(user["id"], 10, 0, 0, 1.0, NOW)]
     rule = client.put("/limits", headers=admin["headers"], json=_rule(user["id"])).json()
-    return SimpleNamespace(user=user, admin=admin, api_key=api_key, rule=rule)
+    return SimpleNamespace(
+        user=user, admin=admin, api_key=api_key, gateway_headers=gateway_headers, rule=rule
+    )
 
 
 def _rule(user_id):
@@ -65,7 +71,7 @@ def _rule(user_id):
 
 ROUTES = {
     # The gateway path and the probes
-    "GET /api/v1/hello": lambda a: ("GET", "/api/v1/hello", {"headers": {"x-api-key": a.api_key["key"]}}),
+    "GET /api/v1/hello": lambda a: ("GET", "/api/v1/hello", {"headers": a.gateway_headers}),
     "GET /health/ready": lambda a: ("GET", "/health/ready", {}),
     # Accounts and keys
     "POST /auth/signup": lambda a: (
@@ -82,6 +88,7 @@ ROUTES = {
     "GET /auth/me": lambda a: ("GET", "/auth/me", {"headers": a.user["headers"]}),
     "GET /auth/users": lambda a: ("GET", "/auth/users?search=test", {"headers": a.admin["headers"]}),
     "GET /auth/apikeys": lambda a: ("GET", "/auth/apikeys", {"headers": a.user["headers"]}),
+    "POST /auth/token": lambda a: ("POST", "/auth/token", {"headers": {"x-api-key": a.api_key["key"]}}),
     "POST /auth/apikeys/create": lambda a: (
         "POST",
         "/auth/apikeys/create",
@@ -116,3 +123,31 @@ def test_database_work_stays_off_the_event_loop(route, client, accounts, queries
 
     assert response.status_code < 400, response.text
     assert queries_on_loop == [], f"{route} queried the database on the event loop"
+
+
+class BrokenRedis:
+    """Every command fails, as when Redis is unreachable."""
+
+    def __getattr__(self, name):
+        async def fail(*args, **kwargs):
+            raise RedisConnectionError("down")
+
+        return fail
+
+    def register_script(self, source):
+        async def fail(*args, **kwargs):
+            raise RedisConnectionError("down")
+
+        return fail
+
+
+def test_the_gateway_keeps_its_fallbacks_off_the_event_loop(client, accounts, queries_on_loop):
+    """With Redis down, the revocation check and the rule lookup both fall
+    back to the database -- still in the threadpool."""
+    redis_client.set_redis(BrokenRedis())
+    rate_limiter.reset_scripts()
+
+    response = client.get("/api/v1/hello", headers=accounts.gateway_headers)
+
+    assert response.status_code == 200, response.text
+    assert queries_on_loop == [], "the gateway queried the database on the event loop"

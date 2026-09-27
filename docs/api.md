@@ -2,16 +2,19 @@
 
 Base URL: `http://localhost:8000`. Interactive docs are served at `/docs`.
 
-## Two credentials
+## Three credentials
 
 | | Used by | Header | Obtained from |
 | --- | --- | --- | --- |
-| **JWT** | the dashboard, a human | `Authorization: Bearer <token>` | `POST /auth/login` |
-| **API key** | machine callers, through the gateway | `x-api-key: <key>` | `POST /auth/apikeys/create` |
+| **Dashboard JWT** | the dashboard, a person | `Authorization: Bearer <token>` | `POST /auth/login` |
+| **API key** | a program, to get gateway tokens | `x-api-key: <key>` | `POST /auth/apikeys/create` |
+| **Gateway JWT** | a program, calling through the gateway | `Authorization: Bearer <token>` | `POST /auth/token` |
 
-They are not interchangeable. A JWT manages the account; an API key is what
-the rate limiter meters. Tokens carry a `type` claim, so a refresh token is
-rejected wherever an access token is required.
+None is accepted in another's place. A dashboard JWT manages the account. An
+API key does one thing: buy gateway tokens. A gateway token calls the API,
+and the rate limiter meters the user it names. Tokens carry a `type` claim,
+so a refresh token is rejected wherever an access token is required, and the
+gateway turns away both.
 
 ### Roles
 
@@ -106,24 +109,46 @@ Lists the caller's own keys. Never returns another user's.
 
 `204` on success, `404` if the key does not exist or belongs to someone else.
 
-Revocation deactivates the row **and** evicts the gateway's cache. Keys are
-cached for `API_KEY_CACHE_TTL` (default 1h), so deactivating alone would
-leave a revoked key working until the TTL lapsed.
+Revocation deactivates the key, so it cannot buy new tokens, **and** puts
+it on the gateway's revocation list, so tokens it already bought stop
+working on their next request rather than when they expire.
+
+---
+
+## Gateway tokens
+
+### `POST /auth/token`
+
+Trades an API key, sent in the `x-api-key` header, for a gateway token. This
+is the only place the key is sent.
+
+```bash
+curl -X POST localhost:8000/auth/token -H "x-api-key: $KEY"
+```
+
+```json
+{ "access_token": "...", "token_type": "bearer", "expires_in": 900 }
+```
+
+The token is a JWT naming the key's owner. It expires after
+`GATEWAY_TOKEN_EXPIRE_MINUTES` (default 15); `expires_in` is in seconds, so a
+client can fetch the next one before it lapses. There is no refresh token:
+trade the key again. `401` if the key is missing, unknown or revoked.
 
 ---
 
 ## Gateway
 
 Any path outside `/auth`, `/health`, `/analytics`, `/limits` and the docs
-requires an API key and is rate limited. (The dashboard APIs are exempt from
-the API key because they authenticate the person with a JWT instead.)
+requires a gateway token and is rate limited. (The dashboard APIs are exempt
+because they authenticate the person with a dashboard JWT instead.)
 
 ### `GET /api/v1/hello`
 
 A minimal protected endpoint used to exercise the gateway path.
 
 ```bash
-curl -i localhost:8000/api/v1/hello -H "x-api-key: $KEY"
+curl -i localhost:8000/api/v1/hello -H "Authorization: Bearer $GATEWAY_TOKEN"
 ```
 
 ### Response headers
@@ -143,7 +168,7 @@ rather than "not enforced".
 
 | Status | Cause |
 | --- | --- |
-| `401` | missing, unknown or revoked API key |
+| `401` | missing, invalid or expired token, or its API key was revoked. Carries `WWW-Authenticate: Bearer` |
 | `429` | rate limit exceeded |
 
 ```json
@@ -201,7 +226,7 @@ Two definitions apply everywhere:
 - **errors** are 4xx and 5xx responses *excluding* 429. Throttling is counted
   separately as `rate_limited`, so a client hitting its limit does not read as
   the API failing.
-- **latency** is gateway time (key lookup, limit check, handler) for served
+- **latency** is gateway time (token check, limit check, handler) for served
   requests. 429s are excluded: they are turned away before the handler runs,
   so counting them would flatter every percentile. Buckets with no served
   requests report `null`, not `0`.

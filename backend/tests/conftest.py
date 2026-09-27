@@ -220,3 +220,21 @@ def api_key(client, user):
     )
     assert response.status_code == 201, response.text
     return response.json()
+
+
+@pytest.fixture
+def gateway_headers_for(client):
+    """Trade an API key for a gateway token; return headers that present it."""
+
+    def _exchange(key):
+        response = client.post("/auth/token", headers={"x-api-key": key})
+        assert response.status_code == 200, response.text
+        return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+    return _exchange
+
+
+@pytest.fixture
+def gateway_headers(gateway_headers_for, api_key):
+    """Headers that authenticate the default user through the gateway."""
+    return gateway_headers_for(api_key["key"])

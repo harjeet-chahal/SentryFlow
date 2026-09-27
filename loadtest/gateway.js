@@ -4,7 +4,7 @@
 // token_bucket. Three scenarios run together, four for the token bucket:
 //
 //   steady     RATE requests/s for DURATION through the full gateway path:
-//              API-key lookup, the limiter's Lua script in Redis, the
+//              the token check, the limiter's Lua script in Redis, the
 //              handler, and the Kafka usage event. Its latency is the number
 //              the thresholds gate on.
 //   throttle   One caller allowed THROTTLE_LIMIT requests, sending far more
@@ -24,8 +24,9 @@
 //
 //   docker compose --profile loadtest run --rm loadtest
 //
-// Setup signs up the callers and sets their limits through the admin API, so
-// it needs the seeded admin's password in ADMIN_PASSWORD.
+// Setup signs up the callers, trades each one's API key for a gateway token
+// and sets their limits through the admin API, so it needs the seeded admin's
+// password in ADMIN_PASSWORD.
 
 import http from 'k6/http';
 import { check, fail, sleep } from 'k6';
@@ -136,7 +137,18 @@ function bearer(token) {
   return { headers: { Authorization: `Bearer ${token}` } };
 }
 
-// Sign up a user and mint an API key for it.
+// Seconds in a k6 duration such as '90s', '5m' or '1h30m'.
+function seconds(duration) {
+  const units = { ms: 0.001, s: 1, m: 60, h: 3600 };
+  const pattern = /(\d+(?:\.\d+)?)(ms|s|m|h)/g;
+  let total = 0;
+  let match;
+  while ((match = pattern.exec(duration)) !== null) total += Number(match[1]) * units[match[2]];
+  return total;
+}
+
+// Sign up a user, mint an API key for it and trade the key for a gateway
+// token. The dashboard token reads analytics; the gateway token calls the API.
 function newCaller(prefix) {
   const username = `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
   const password = 'load-test-password';
@@ -144,14 +156,22 @@ function newCaller(prefix) {
   const signup = http.post(`${BASE_URL}/auth/signup`, body, { headers });
   if (signup.status !== 201) fail(`signup failed: ${signup.status} ${signup.body}`);
 
-  const token = login(username, password);
+  const dashboardToken = login(username, password);
   const key = http.post(
     `${BASE_URL}/auth/apikeys/create`,
     JSON.stringify({ name: 'k6' }),
-    { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` } },
+    { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${dashboardToken}` } },
   );
   if (key.status !== 201) fail(`api key creation failed: ${key.status} ${key.body}`);
-  return { id: signup.json('id'), token, key: key.json('key') };
+
+  const exchange = http.post(`${BASE_URL}/auth/token`, null, { headers: { 'x-api-key': key.json('key') } });
+  if (exchange.status !== 200) fail(`token exchange failed: ${exchange.status} ${exchange.body}`);
+  return {
+    id: signup.json('id'),
+    dashboardToken,
+    gatewayToken: exchange.json('access_token'),
+    expiresIn: exchange.json('expires_in'),
+  };
 }
 
 // burstCapacity only matters to the token bucket.
@@ -185,17 +205,26 @@ export function setup() {
   if (TOKEN_BUCKET) setLimit(admin, throttled.id, 1, THROTTLE_LIMIT);
   else setLimit(admin, throttled.id, THROTTLE_LIMIT);
 
-  const data = { steadyKey: steady.key, throttleKey: throttled.key };
+  // The tokens are minted once, here, so they have to outlast the run.
+  const runSeconds = seconds(DURATION) + 60;
+  if (steady.expiresIn < runSeconds) {
+    fail(
+      `gateway tokens last ${steady.expiresIn}s but this run needs ${runSeconds}s; ` +
+        'raise GATEWAY_TOKEN_EXPIRE_MINUTES on the gateway',
+    );
+  }
+
+  const data = { steadyToken: steady.gatewayToken, throttleToken: throttled.gatewayToken };
   if (TOKEN_BUCKET) {
     const refilling = newCaller('refill');
     setLimit(admin, refilling.id, 60, REFILL_BURST);
-    data.refillKey = refilling.key;
+    data.refillToken = refilling.gatewayToken;
   }
   return data;
 }
 
 export function steady(data) {
-  const res = http.get(`${BASE_URL}/api/v1/hello`, { headers: { 'x-api-key': data.steadyKey } });
+  const res = http.get(`${BASE_URL}/api/v1/hello`, bearer(data.steadyToken));
   check(res, {
     'served (200)': (r) => r.status === 200,
     'carries rate-limit headers': (r) => r.headers['X-Ratelimit-Limit'] !== undefined,
@@ -204,7 +233,7 @@ export function steady(data) {
 
 export function throttle(data) {
   const res = http.get(`${BASE_URL}/api/v1/hello`, {
-    headers: { 'x-api-key': data.throttleKey },
+    ...bearer(data.throttleToken),
     // 429 is the expected outcome here, not a failure.
     responseCallback: http.expectedStatuses(200, 429),
   });
@@ -217,9 +246,9 @@ export function throttle(data) {
 }
 
 // Send `size` requests at once; return how many were served.
-function burst(key, size) {
+function burst(token, size) {
   const params = {
-    headers: { 'x-api-key': key },
+    ...bearer(token),
     responseCallback: http.expectedStatuses(200, 429),
   };
   const url = `${BASE_URL}/api/v1/hello`;
@@ -228,20 +257,20 @@ function burst(key, size) {
 }
 
 export function refill(data) {
-  refillFirstAllowed.add(burst(data.refillKey, REFILL_BURST * 2));
+  refillFirstAllowed.add(burst(data.refillToken, REFILL_BURST * 2));
   sleep(REFILL_WAIT);
-  refillSecondAllowed.add(burst(data.refillKey, REFILL_BURST * 2));
+  refillSecondAllowed.add(burst(data.refillToken, REFILL_BURST * 2));
 }
 
 export function freshness() {
   const caller = newCaller('fresh');
   for (let i = 0; i < FRESHNESS_REQUESTS; i++) {
-    http.get(`${BASE_URL}/api/v1/hello`, { headers: { 'x-api-key': caller.key } });
+    http.get(`${BASE_URL}/api/v1/hello`, bearer(caller.gatewayToken));
   }
   const sentAt = Date.now();
 
   while (Date.now() - sentAt < 30000) {
-    const res = http.get(`${BASE_URL}/analytics/usage?range=1h`, bearer(caller.token));
+    const res = http.get(`${BASE_URL}/analytics/usage?range=1h`, bearer(caller.dashboardToken));
     if (res.status === 200 && res.json('summary.requests') >= FRESHNESS_REQUESTS) {
       analyticsFreshness.add(Date.now() - sentAt);
       return;
