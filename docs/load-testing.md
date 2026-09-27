@@ -7,7 +7,7 @@ default) or `token_bucket`.
 
 | Scenario | What it does | Pass condition |
 | --- | --- | --- |
-| **steady** | `RATE` requests/s for `DURATION` through the full gateway path: API-key lookup, the limiter's Lua script in Redis, the handler, and the Kafka usage event | p95 **and** p99 under 100 ms; under 0.1% failures |
+| **steady** | `RATE` requests/s for `DURATION` through the full gateway path: the token check, the limiter's Lua script in Redis, the handler, and the Kafka usage event | p95 **and** p99 under 100 ms; under 0.1% failures |
 | **throttle** | one caller allowed 30 requests sends 5/s from several VUs for 45 s. The sliding window allows 30 per minute. The token bucket holds 30 tokens and refills at 1 per minute, which adds less than one token in 45 s | exactly 30 succeed; every other response is a 429 with `Retry-After` |
 | **refill** | token bucket only. A caller with a 10-token bucket refilling at 1/s sends 20 requests at once, waits 5.5 s, and sends 20 more | exactly 10, then exactly 5, succeed |
 | **freshness** | mid-run, a new user sends 20 requests and polls `/analytics/usage` until they appear | visible in under 10 s |
@@ -17,9 +17,12 @@ The thresholds are the pass/fail gate: k6 exits non-zero if any is missed.
 ## Running it
 
 k6 runs from its container on the compose network, so it measures the gateway
-rather than Docker Desktop's port forwarding. Setup signs up throwaway users
-and sets their limits through the admin API, so it needs the admin password
-(`docker compose logs migrate` shows a generated one).
+rather than Docker Desktop's port forwarding. Setup signs up throwaway users,
+trades their API keys for gateway tokens and sets their limits through the
+admin API, so it needs the admin password (`docker compose logs migrate`
+shows a generated one). The tokens are minted once, in setup, and last
+`GATEWAY_TOKEN_EXPIRE_MINUTES` (15 by default), so setup fails early if
+`DURATION` would outlast them.
 
 ```bash
 docker compose up -d --build
@@ -42,7 +45,9 @@ The full k6 summary is also written to `loadtest/results/summary.json`
 Measured on 2026-09-24 against the compose stack: one gateway process (a
 single uvicorn worker), Redis, Kafka, ClickHouse and Postgres all in Docker
 Desktop on an Apple M4 Pro (12 CPUs, 7.6 GB given to Docker). Latency is
-client-observed through the gateway, for the steady scenario only.
+client-observed through the gateway, for the steady scenario only. These runs,
+and the comparisons below them, authenticated with API keys; what JWTs cost
+instead is under [API keys vs JWTs](#api-keys-vs-jwts).
 
 | Offered rate | Requests | Median | p95 | p99 | Max | Failures |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -65,9 +70,9 @@ bounded by the aggregator's 2-second flush interval.
   Helm chart's HPA scales the gateway from 3 to 12 replicas, and all replicas
   share one Redis, so limits hold across them.
 - **This measures gateway overhead, not a backend.** `/api/v1/hello` does no
-  work, so the time is the gateway itself: three Redis round trips (the cached
-  key lookup, the cached rule lookup and the Lua limiter script) and queueing
-  an event for the Kafka publisher.
+  work, so the time is the gateway itself: three Redis round trips
+  (authentication, the cached rule lookup and the Lua limiter script) and
+  queueing an event for the Kafka publisher.
   A proxied upstream adds its own latency on top.
 - **It is a laptop, not AWS.** There is no network hop, TLS or load balancer
   between k6 and the gateway, and every dependency shares the same machine.
@@ -153,3 +158,28 @@ other, not with the tables above.
   minute of traffic doubles that, and it is per caller. The size is bounded by
   the limit, so it only matters for callers with high limits. The token
   bucket's key was 186–187 bytes in every run.
+
+### API keys vs JWTs
+
+Until 2026-09-27 the gateway authenticated each request by looking its API
+key up in Redis. It now takes a JWT, which it verifies in-process, plus one
+Redis call to check that the token's key has not been revoked since. That is
+the same number of round trips as before; the new work is verifying the
+token. To price it, the steady scenario ran against the code before and after,
+alternating, on the same laptop: the gateway under uvicorn on the host with
+SQLite, Redis in Docker, and k6 in Docker reaching the host through Docker
+Desktop. There was no Kafka or ClickHouse, so usage events were dropped once
+the queue filled and the freshness scenario could not pass. Compare these
+rows with each other, not with the tables above.
+
+| Offered rate, 30 s | Authentication | Median | p95 | p99 | Failures |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1,000/s | API key | 1.48, 1.47 ms | 2.07, 2.21 ms | 4.6, 5.7 ms | 0 |
+| 1,000/s | JWT | 1.55, 1.53 ms | 2.25, 2.24 ms | 5.3, 5.2 ms | 0 |
+
+- **About 0.06 ms at the median.** Both pairs agree on that; p95 and p99 moved
+  within run-to-run noise. Timed on its own against the same Redis, the token
+  check took about 20 µs longer than the key lookup it replaced, and verifying
+  the signature accounts for 7 µs of that.
+- **Still exact.** The throttled caller got exactly 30 successes in every run.
+  A fifth run, JWTs with the token bucket, passed the refill check: 10, then 5.
