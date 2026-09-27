@@ -189,6 +189,7 @@ services:
       ADMIN_PASSWORD: ${SENTRYFLOW_ADMIN_PASSWORD:-}
       RATE: ${LOADTEST_RATE:-200}
       DURATION: ${LOADTEST_DURATION:-60s}
+      ALGORITHM: ${LOADTEST_ALGORITHM:-sliding_window}
     command: ["run", "--summary-export", "/scripts/results/summary.json", "/scripts/gateway.js"]
 
 volumes:
