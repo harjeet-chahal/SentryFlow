@@ -1,86 +1,106 @@
-# SentryFlow Makefile
+# SentryFlow
 
-.PHONY: help setup dev-backend dev-frontend dev-aggregator test lint clean docker-build docker-up docker-down
+.PHONY: help setup test test-backend test-aggregator test-integration test-frontend \
+        lint clean dev-backend dev-frontend dev-aggregator loadtest \
+        docker-build docker-up docker-down docker-logs docker-ps \
+        db-setup clickhouse-setup helm-lint helm-template k8s-validate
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
-setup: ## Setup the project (install dependencies, create .env files)
-	@echo "Setting up SentryFlow project..."
+setup: ## Install dependencies and create .env files
 	@if [ ! -f "backend/.env" ]; then cp backend/.env.example backend/.env; fi
 	@if [ ! -f "aggregator/.env" ]; then cp aggregator/.env.example aggregator/.env; fi
 	@if [ ! -f "frontend/.env" ]; then cp frontend/.env.example frontend/.env; fi
-	@echo "Installing backend dependencies..."
 	cd backend && pip install -r requirements.txt
-	@echo "Installing aggregator dependencies..."
 	cd aggregator && pip install -r requirements.txt
-	@echo "Installing frontend dependencies..."
 	cd frontend && npm install
-	@echo "Setup complete!"
+	@echo "Setup complete."
 
-dev-backend: ## Run backend in development mode
-	cd backend && uvicorn main:app --reload --host 0.0.0.0 --port 8000
+# --- Development ------------------------------------------------------------
 
-dev-frontend: ## Run frontend in development mode
+dev-backend: ## Run the gateway with reload
+	uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
+
+dev-frontend: ## Run the dashboard dev server
 	cd frontend && npm start
 
-dev-aggregator: ## Run aggregator in development mode
-	cd aggregator && python batch_consumer.py
+dev-aggregator: ## Run the Kafka -> ClickHouse aggregator
+	python -m aggregator.batch_consumer
 
-test: ## Run all tests
-	@echo "Running backend tests..."
-	cd backend && pytest
-	@echo "Running aggregator tests..."
-	cd aggregator && pytest
-	@echo "Running frontend tests..."
-	cd frontend && npm test
+# --- Tests ------------------------------------------------------------------
 
-test-backend: ## Run backend tests
+test: test-backend test-aggregator test-frontend ## Run all unit test suites
+
+test-backend: ## Run backend tests with coverage (fails under 90%)
 	cd backend && pytest
 
-test-aggregator: ## Run aggregator tests
+test-aggregator: ## Run aggregator tests with coverage (fails under 90%)
 	cd aggregator && pytest
+
+# Needs a ClickHouse, e.g. the compose one: make docker-up first.
+test-integration: ## Run the analytics SQL against a real ClickHouse
+	cd backend && CLICKHOUSE_TEST_HOST=$${CLICKHOUSE_TEST_HOST:-localhost} \
+		CLICKHOUSE_TEST_USER=$${CLICKHOUSE_TEST_USER:-sentryflow} \
+		CLICKHOUSE_TEST_PASSWORD=$${CLICKHOUSE_TEST_PASSWORD:-sentryflow} \
+		pytest tests/integration --no-cov
 
 test-frontend: ## Run frontend tests
-	cd frontend && npm test
+	cd frontend && npm test -- --watchAll=false --passWithNoTests
 
-lint: ## Run linters
-	@echo "Linting backend code..."
-	cd backend && flake8
-	@echo "Linting aggregator code..."
-	cd aggregator && flake8
-	@echo "Linting frontend code..."
-	cd frontend && npm run lint
+coverage: ## Open the backend HTML coverage report
+	cd backend && pytest && open coverage_html/index.html
 
-clean: ## Clean up temporary files
-	find . -type d -name __pycache__ -exec rm -rf {} +
-	find . -type d -name .pytest_cache -exec rm -rf {} +
-	find . -type d -name .coverage -exec rm -rf {} +
-	find . -type d -name node_modules -exec rm -rf {} +
-	find . -type d -name build -exec rm -rf {} +
+lint: ## Lint backend and frontend
+	cd backend && flake8 --max-line-length 100 --exclude __pycache__,coverage_html
+	cd frontend && npx eslint src --ext .js
 
-# Docker commands
-docker-build: ## Build all Docker images
-	docker-compose build
+# --- Docker -----------------------------------------------------------------
 
-docker-up: ## Start all services with Docker Compose
-	docker-compose up -d
+docker-build: ## Build all images
+	docker compose build
 
-docker-down: ## Stop all services with Docker Compose
-	docker-compose down
+docker-up: ## Build and start the full stack
+	docker compose up -d --build
 
-docker-logs: ## View logs from all services
-	docker-compose logs -f
+docker-down: ## Stop the stack
+	docker compose down
+
+docker-logs: ## Tail logs from all services
+	docker compose logs -f
 
 docker-ps: ## List running containers
-	docker-compose ps
+	docker compose ps
 
-# Database commands
-db-setup: ## Setup the database (create tables, initial data)
-	cd backend && python setup_db.py
+loadtest: ## Load-test the running stack with k6 (needs SENTRYFLOW_ADMIN_PASSWORD)
+	docker compose --profile loadtest run --rm loadtest
 
-clickhouse-setup: ## Setup ClickHouse database (create tables)
-	cd aggregator && python setup_clickhouse.py
+# --- Data stores ------------------------------------------------------------
 
-# Default target
+db-setup: ## Create tables and seed the admin user (idempotent)
+	python -m backend.setup_db
+
+clickhouse-setup: ## Create the ClickHouse table (the aggregator also does this)
+	python -m aggregator.setup_clickhouse
+
+# --- Kubernetes -------------------------------------------------------------
+
+helm-lint: ## Lint the Helm chart
+	helm lint kubernetes/chart --set secrets.postgresPassword=placeholder
+
+helm-template: ## Render the chart to stdout
+	@helm template sentryflow kubernetes/chart \
+		--set secrets.postgresPassword=placeholder --set ingress.enabled=true
+
+k8s-validate: ## Validate rendered manifests against Kubernetes schemas
+	@$(MAKE) --no-print-directory helm-template \
+		| kubeconform -kubernetes-version 1.29.0 -strict -summary
+
+# --- Housekeeping -----------------------------------------------------------
+
+clean: ## Remove build and test artefacts
+	find . -type d -name __pycache__ -prune -exec rm -rf {} +
+	find . -type d -name .pytest_cache -prune -exec rm -rf {} +
+	rm -rf backend/coverage_html backend/.coverage frontend/build
+
 .DEFAULT_GOAL := help

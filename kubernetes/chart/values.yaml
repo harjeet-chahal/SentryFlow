@@ -1,0 +1,148 @@
+# Default values for SentryFlow.
+# Production overrides live in values-production.yaml.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  registry: ""          # e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com
+  pullPolicy: IfNotPresent
+  tag: ""               # defaults to .Chart.AppVersion
+
+backend:
+  enabled: true
+  image:
+    repository: sentryflow-backend
+  replicaCount: 3
+  # The gateway is I/O bound, not CPU bound: it awaits Redis and Postgres.
+  # Requests are sized for steady state and limits leave burst headroom.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 192Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 12
+    targetCPUUtilizationPercentage: 70
+  # Two is the floor that lets a node drain without dropping to a single pod.
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+
+aggregator:
+  enabled: true
+  image:
+    repository: sentryflow-aggregator
+  # One replica per partition at most; extra consumers in a group sit idle.
+  replicaCount: 2
+  # For topics the aggregator creates itself (see batch_consumer.ensure_topics).
+  topicPartitions: 3
+  topicReplication: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+frontend:
+  enabled: true
+  image:
+    repository: sentryflow-frontend
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+# Idempotent schema creation, run as a pre-install/pre-upgrade hook.
+migration:
+  enabled: true
+
+serviceAccount:
+  create: true
+  name: ""
+  # On EKS, bind an IAM role here (IRSA) instead of mounting static keys:
+  # annotations:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/sentryflow
+  annotations: {}
+
+service:
+  type: ClusterIP
+  backendPort: 8000
+  frontendPort: 80
+
+ingress:
+  enabled: false
+  className: alb
+  # ALB annotations for EKS via the AWS Load Balancer Controller.
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/healthcheck-path: /health/live
+  host: sentryflow.example.com
+  tls: []
+
+config:
+  environment: production
+  logLevel: INFO
+  corsOrigins: "https://sentryflow.example.com"
+  defaultRateLimit: "60"
+  defaultRateLimitWindow: "60"
+  defaultRateLimitAlgorithm: sliding_window
+  defaultBurstCapacity: "10"
+  # Fail open: a Redis outage should degrade enforcement, not the API.
+  rateLimitFailOpen: "true"
+  accessTokenExpireMinutes: "30"
+  refreshTokenExpireDays: "7"
+
+# Managed endpoints. In production these point at RDS, ElastiCache and MSK.
+externalServices:
+  postgresHost: sentryflow-postgres.internal
+  postgresPort: "5432"
+  postgresDatabase: sentryflow
+  redisHost: sentryflow-redis.internal
+  redisPort: "6379"
+  kafkaBootstrapServers: sentryflow-kafka.internal:9092
+  clickhouseHost: sentryflow-clickhouse.internal
+  clickhousePort: "9000"
+  clickhouseDatabase: sentryflow
+
+# Secrets. Leave `create: false` and supply existingSecret when the values
+# come from External Secrets Operator or AWS Secrets Manager.
+secrets:
+  create: true
+  existingSecret: ""
+  jwtSecret: ""          # required when create=true; generated if blank
+  postgresUser: postgres
+  postgresPassword: ""
+  clickhouseUser: default
+  clickhousePassword: ""
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+# Spread replicas across zones so a single-AZ failure cannot take the API down.
+topologySpreadEnabled: true

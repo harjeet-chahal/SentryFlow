@@ -1,18 +1,34 @@
+"""Database engine and session factory.
+
+The declarative ``Base`` lives in ``models.py`` and is re-exported here so
+that either import path resolves to the same metadata. Two separate
+``declarative_base()`` calls would silently give two registries, and
+``create_all`` would then only create half the schema.
+"""
 from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-import os
 
-# Get database URL from environment variable or use default SQLite for development
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./sentryflow.db")
+from backend.config import settings
+from backend.models.models import Base  # noqa: F401 - re-exported for convenience
 
-# Create SQLAlchemy engine
-engine = create_engine(
-    DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-)
+_is_sqlite = settings.DATABASE_URL.startswith("sqlite")
 
-# Create SessionLocal class for database sessions
+if _is_sqlite:
+    # SQLite is the zero-setup default for local runs and tests.
+    engine = create_engine(
+        settings.DATABASE_URL,
+        connect_args={"check_same_thread": False},
+    )
+else:
+    engine = create_engine(
+        settings.DATABASE_URL,
+        pool_size=10,
+        max_overflow=20,
+        # Validate a connection before handing it out. Without this, every
+        # RDS failover or idle-timeout reaping surfaces as a burst of
+        # "server closed the connection unexpectedly" errors.
+        pool_pre_ping=True,
+        pool_recycle=1800,
+    )
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-# Create Base class for declarative models
-Base = declarative_base()

@@ -1,140 +1,257 @@
+<img src="docs/logo.svg" alt="SentryFlow" width="72" />
+
 # SentryFlow
-**A comprehensive API monitoring and management system**
 
-## Overview
+**Real-time API rate limiting and usage analytics.**
 
-SentryFlow is a robust API monitoring and management system designed to help developers track, analyze, and optimize their API usage. It provides real-time metrics, rate limiting, authentication, and comprehensive logging to ensure your APIs are secure, performant, and reliable.
+SentryFlow is an API gateway that authenticates callers, enforces per-user
+rate limits, and streams every request into an analytics pipeline. A React
+dashboard shows live usage, latency and throttling from that pipeline, and
+lets administrators change limits that apply on the next request.
 
-## Features
-
-- **API Key Management**: Create, manage, and revoke API keys with fine-grained permissions
-- **Rate Limiting**: Implement sliding window and token bucket rate limiting algorithms
-- **Real-time Monitoring**: Track API usage, response times, and error rates in real-time
-- **User-specific Analytics**: View metrics and usage patterns for individual users
-- **Comprehensive Logging**: Log all API requests with detailed information for auditing and debugging
-- **Interactive Dashboard**: Visualize API performance and usage through intuitive charts and graphs
-- **Alerts and Notifications**: Get notified when API usage exceeds thresholds or errors occur
+---
 
 ## Architecture
 
-SentryFlow consists of three main components:
-
-1. **Backend API Service**: A FastAPI application that handles authentication, rate limiting, and request logging
-2. **Analytics Aggregator**: A service that consumes API logs from Kafka and aggregates metrics in ClickHouse
-3. **Frontend Dashboard**: A React application that visualizes API metrics and provides management interfaces
-
-### Technology Stack
-
-- **Backend**: FastAPI, SQLAlchemy, Redis, Kafka
-- **Analytics**: ClickHouse, Kafka Consumers
-- **Frontend**: React, Chart.js, Tailwind CSS
-- **Infrastructure**: Docker, GitHub Actions
-
-## Getting Started
-
-### Prerequisites
-
-- Python 3.9+
-- Node.js 16+
-- PostgreSQL
-- Redis
-- Kafka
-- ClickHouse
-
-### Installation
-
-#### Clone the repository
-
-```bash
-git clone https://github.com/yourusername/sentryflow.git
-cd sentryflow
+```
+ client ──x-api-key──┐
+                     ▼
+               ┌─────────────┐  authenticate   API key, cached in Redis
+               │   Gateway   │  rate limit     Redis + Lua, atomic
+ dashboard ───▶│  (FastAPI)  │  record         Kafka, fire-and-forget
+ (React, JWT)  └──┬───────▲──┘  analytics      read-only ClickHouse queries
+                  │       │
+                  ▼       │
+             ┌───────┐  ┌─┴──────────┐
+             │ Kafka │  │ ClickHouse │
+             └───┬───┘  └─▲──────────┘
+                 │        │
+                 └──▶ Aggregator  (batches of 1,000 or every 2 s)
 ```
 
-#### Backend Setup
+Each request passes through one middleware chain in a fixed order:
+**authenticate → rate limit → serve → record**. Authentication precedes rate
+limiting so an unauthenticated caller cannot burn another user's budget.
+
+| Layer | Technology |
+| --- | --- |
+| Gateway | Python 3.11, FastAPI, SQLAlchemy |
+| Rate limiting | Redis with Lua scripts |
+| Identity | JWT (dashboard), API keys (machine callers) |
+| Streaming | Kafka (`aiokafka`) |
+| Analytics | ClickHouse; percentiles computed at query time from raw events |
+| Dashboard | React 18, Chart.js, Tailwind; refreshes every 10 s |
+| Load testing | k6 |
+| Orchestration | Kubernetes (Helm), Docker Compose for local |
+| Cloud | AWS — EKS, RDS, ElastiCache, MSK, ECR, ALB |
+
+---
+
+## Rate limiting
+
+Two algorithms, both implemented as Redis Lua scripts so the
+read-modify-write cycle is atomic on the server. Doing this in Python would
+need a `WATCH`/`MULTI` retry loop and would still lose under contention.
+
+**Sliding window** — one sorted-set entry per request, scored by timestamp,
+trimmed to the trailing window. Precise at the boundary: a fixed window lets a
+caller send twice the limit across the boundary instant, a sliding window does
+not. Costs O(log N) and one member per in-flight request.
+
+**Token bucket** — two fields per key regardless of traffic, refilled lazily
+from elapsed time. Allows a deliberate burst above the steady rate.
+
+Limits resolve per user and per endpoint (exact match, then a `*` wildcard,
+then global defaults), cached in Redis for 60s so the database stays off the
+hot path. Misses are cached too, so callers on defaults never re-query.
+
+Both scripts are deterministic — timestamps and sorted-set members are passed
+in as arguments rather than generated inside Lua — so they replicate safely.
+
+Responses carry `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and on a 429 a
+`Retry-After` computed from when the oldest request ages out.
+
+---
+
+## Quick start
 
 ```bash
-# Create a virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-cd backend
-pip install -r requirements.txt
-
-# Set up environment variables
-cp .env.example .env
-# Edit .env with your configuration
-
-# Run migrations
-alembic upgrade head
-
-# Start the backend server
-uvicorn main:app --reload
+SENTRYFLOW_ADMIN_PASSWORD=choose-one docker compose up -d --build
 ```
 
-#### Analytics Aggregator Setup
+A one-shot `migrate` service creates the schema and the `admin` account. Leave
+`SENTRYFLOW_ADMIN_PASSWORD` unset and it generates one instead
+(`docker compose logs migrate`). Sign in to the dashboard as `admin` to see
+every user's traffic and edit limits; accounts created through sign-up see
+only their own.
+
+| | |
+| --- | --- |
+| Dashboard | http://localhost |
+| API docs | http://localhost:8000/docs |
+| Kafka UI | http://localhost:8080 (`docker compose --profile tools up -d kafka-ui`) |
+
+Host ports move with `BACKEND_PORT`, `DASHBOARD_PORT` and friends if something
+else already holds them.
+
+Without Docker (SQLite, and no analytics without Kafka and ClickHouse):
 
 ```bash
-# In a new terminal
-cd aggregator
-pip install -r requirements.txt
+pip install -r backend/requirements.txt
+python -m backend.setup_db
+uvicorn backend.main:app --reload
 
-# Set up environment variables
-cp .env.example .env
-# Edit .env with your configuration
-
-# Start the aggregator
-python batch_consumer.py
+cd frontend && npm install && npm start
 ```
 
-#### Frontend Setup
+### Using the gateway
 
 ```bash
-# In a new terminal
-cd frontend
-npm install
+# 1. Register and log in (form-encoded: OAuth2 password flow)
+curl -X POST localhost:8000/auth/signup \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"demo","email":"demo@example.com","password":"demo-password"}'
 
-# Start the development server
-npm start
+TOKEN=$(curl -s -X POST localhost:8000/auth/login \
+  -d 'username=demo&password=demo-password' | python -c 'import json,sys;print(json.load(sys.stdin)["access_token"])')
+
+# 2. Mint an API key
+KEY=$(curl -s -X POST localhost:8000/auth/apikeys/create \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"demo-key"}' | python -c 'import json,sys;print(json.load(sys.stdin)["key"])')
+
+# 3. Call through the gateway
+curl -i localhost:8000/api/v1/hello -H "x-api-key: $KEY"
 ```
 
-### Docker Deployment
+---
 
-For production deployment, you can use Docker Compose:
+## Tests
 
 ```bash
-# Build and start all services
-docker-compose up -d
+cd backend && pytest          # gateway, auth, limiter, analytics API
+cd aggregator && pytest       # Kafka -> ClickHouse ingestion
+cd frontend && npm test       # dashboard helpers and pages
 ```
 
-## Usage
+| Suite | Tests | Coverage |
+| --- | ---: | ---: |
+| Backend | 252 | **94%** statement and branch (CI floor 90%) |
+| Aggregator | 32 | 99% (CI floor 90%) |
+| Analytics SQL, against real ClickHouse | 11 | — |
+| Frontend | 97 | — |
 
-### Creating an API Key
+The unit suites need no running services. Postgres is replaced by SQLite;
+Redis by `fakeredis`, which runs the real Lua scripts, so the limiter
+algorithms are genuinely under test; Kafka by a recording double; and
+ClickHouse by canned rows per named query. Because canned rows cannot prove
+SQL correct, `backend/tests/integration` runs every analytics query against a
+real ClickHouse (a service container in CI) with known events and checks the
+numbers.
 
-1. Register a user account or log in to an existing account
-2. Navigate to the API Keys section
-3. Click "Create New API Key" and provide a name for the key
-4. Copy the generated API key (it will only be shown once)
+Coverage of the gateway middleware is understated by a couple of points: the
+tracer stops following a coroutine at its first `await`, so lines after it
+read as uncovered even though `tests/test_gateway.py` drives them over HTTP.
 
-### Implementing Rate Limits
+Beyond happy paths, the suites cover: sliding-window boundary behaviour,
+token-bucket refill and capping, fail-open and fail-closed on a Redis outage,
+refresh tokens rejected as access tokens, forged and expired tokens, per-user
+data scoping and admin-only writes, limit changes applying on the very next
+request, revocation evicting the cache, Kafka outages not reaching callers,
+at-least-once commit ordering in the aggregator, and password hashing staying
+off the event loop.
 
-1. Go to the Rate Limit Monitor section
-2. Configure rate limits for specific endpoints
-3. Choose between sliding window or token bucket algorithms
-4. Set appropriate limits and time windows
+---
 
-### Monitoring API Usage
+## Performance
 
-1. Visit the Dashboard to view overall metrics
-2. Use the User View to analyze specific user behavior
-3. Check the Logs Explorer for detailed request information
+k6 against the compose stack, one gateway process, all services on one laptop
+([full results](docs/load-testing.md)):
 
+| Offered load | Requests | p95 | p99 | Failures |
+| ---: | ---: | ---: | ---: | ---: |
+| 200/s for 60 s | 12,001 | 2.3 ms | 2.9 ms | 0 |
+| 1,000/s for 30 s | 30,001 | 1.4 ms | 2.7 ms | 0 |
+| 1,500/s for 30 s | 45,001 | 3.0 ms | 24.9 ms | 0 |
 
-## Acknowledgements
+One worker saturates between 1,500 and 2,000 requests/s; the Helm chart's HPA
+scales the gateway from 3 to 12 pods on shared Redis. In every run a caller
+limited to 30/min got exactly 30 responses, and new requests reached the
+analytics API within 2.1 s.
 
-- [FastAPI](https://fastapi.tiangolo.com/)
-- [React](https://reactjs.org/)
-- [Chart.js](https://www.chartjs.org/)
-- [Tailwind CSS](https://tailwindcss.com/)
-- [Kafka](https://kafka.apache.org/)
-- [ClickHouse](https://clickhouse.tech/)
+---
+
+## Deployment
+
+Helm chart in [`kubernetes/chart`](kubernetes/chart), full guide in
+[`docs/deployment.md`](docs/deployment.md).
+
+```bash
+helm upgrade --install sentryflow ./kubernetes/chart \
+  --namespace sentryflow --create-namespace \
+  -f ./kubernetes/chart/values-production.yaml \
+  --set image.tag=$(git rev-parse --short HEAD) --wait
+```
+
+Rendered manifests are validated against real Kubernetes schemas in CI
+(`kubeconform -strict`).
+
+---
+
+## Design decisions
+
+**Liveness checks nothing.** `/health/live` touches no dependency; a liveness
+probe that checked Redis would restart every pod during a Redis blip, turning
+a degraded dependency into an outage. `/health/ready` checks Postgres and
+Redis, so an affected pod leaves the Service and rejoins on recovery without a
+restart.
+
+**Kafka is non-critical.** Usage logging is fire-and-forget — the producer
+buffers and the request returns without waiting for a broker ack, because
+waiting would put Kafka round-trip latency on every client request. A broker
+outage loses analytics events rather than failing requests. That is the right
+trade for usage data and the wrong one for billing.
+
+**The limiter fails open.** If Redis is unreachable, requests are served
+without enforcement (`RATE_LIMIT_FAIL_OPEN`, default true). Losing the rate
+limiter should degrade enforcement, not cause an API outage. Authentication,
+by contrast, never fails open — a cache outage degrades it to
+database-per-request.
+
+**No secrets in source.** The JWT signing key is read from the environment,
+and the application refuses to boot when `ENVIRONMENT=production` and
+`JWT_SECRET` is unset rather than falling back to a default. In development it
+mints an ephemeral key.
+
+**Revocation evicts the cache.** API keys are cached for an hour, so
+deactivating the row alone would leave a revoked key working until the TTL
+lapsed. Changing or deleting a rate-limit rule does the same for the cached
+rule resolution, so new limits apply on the next request.
+
+**Operators set limits, customers do not.** Anyone can read the limits that
+apply to them, but only admins can change them; a customer who could raise
+their own limit would not really have one. Users see only their own traffic,
+and asking for someone else's is a 403, not an empty result.
+
+**Analytics are computed at query time.** The aggregator writes raw events and
+ClickHouse aggregates on read. Percentiles cannot be rebuilt from
+pre-aggregated percentiles, and there are no rollup tables to keep consistent.
+The dashboard's ClickHouse connection is read-only and time-bounded.
+
+**Nothing slow on the event loop.** bcrypt, database lookups and ClickHouse
+queries run in the threadpool. The load test caught bcrypt running inline:
+each login stalled every in-flight request for about 200 ms.
+
+---
+
+## Documentation
+
+- [API reference](docs/api.md)
+- [Rate limiting](docs/rate-limiting.md)
+- [Analytics pipeline](docs/analytics.md)
+- [Load testing](docs/load-testing.md)
+- [Deployment](docs/deployment.md)
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).

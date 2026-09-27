@@ -2,6 +2,7 @@
 fastapi==0.95.1
 uvicorn==0.22.0
 pydantic==1.10.7
+email-validator==2.0.0
 python-multipart==0.0.6
 python-dotenv==1.0.0
 PyJWT==2.8.0
@@ -22,14 +23,20 @@ async-timeout==4.0.2
 
 # Kafka
 aiokafka==0.8.1
+# aiokafka 0.8 imports kafka.conn, which kafka-python 3.x removed, and it
+# does not cap the version itself. Unpinned, a fresh install breaks on import.
+kafka-python==2.0.2
+
+# Analytics (read side; the aggregator writes)
+clickhouse-driver==0.2.9
 
 # Testing
 pytest==7.3.1
 pytest-asyncio==0.21.0
 pytest-cov==4.1.0
 httpx==0.24.1
+fakeredis[lua]==2.21.3
 
 # Utilities
-asyncio==3.4.3
 tenacity==8.2.2
 json-logging==1.3.0

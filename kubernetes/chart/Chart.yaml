@@ -1,0 +1,12 @@
+apiVersion: v2
+name: sentryflow
+description: API gateway with distributed rate limiting and usage analytics
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - api-gateway
+  - rate-limiting
+  - analytics
+maintainers:
+  - name: SentryFlow

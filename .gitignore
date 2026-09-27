@@ -46,6 +46,7 @@ frontend/build/
 # Testing
 .coverage
 htmlcov/
+coverage_html/
 .pytest_cache/
 coverage/
 

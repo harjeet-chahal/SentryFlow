@@ -13,8 +13,12 @@ class UserCreate(UserBase):
 
 
 class UserResponse(UserBase):
+    # Validated on the way in, not on the way out: an address stored before
+    # a validator change must not turn every read of the account into a 500.
+    email: str
     id: str
     is_active: bool
+    is_admin: bool = False
     created_at: datetime
     
     class Config:
@@ -25,6 +29,10 @@ class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
 
 
 class ApiKeyBase(BaseModel):
@@ -41,27 +49,6 @@ class ApiKeyResponse(ApiKeyBase):
     created_at: datetime
     last_used_at: Optional[datetime] = None
     is_active: bool
-    
-    class Config:
-        orm_mode = True
-
-
-class RateLimitBase(BaseModel):
-    endpoint: str
-    requests_per_minute: int = 60
-    burst_capacity: int = 10
-    algorithm: str = "sliding_window"
-
-
-class RateLimitCreate(RateLimitBase):
-    pass
-
-
-class RateLimitResponse(RateLimitBase):
-    id: str
-    user_id: str
-    created_at: datetime
-    updated_at: datetime
     
     class Config:
         orm_mode = True

@@ -1,29 +1,24 @@
 # Build stage
-FROM node:16-alpine as build
+FROM node:18-alpine AS build
 
 WORKDIR /app
 
-# Install dependencies
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm ci --no-audit --no-fund
 
-# Copy source code
 COPY . .
-
-# Build the application
+# Baked into the bundle at build time. Empty means same-origin: nginx (or the
+# Kubernetes ingress) routes the API paths to the gateway.
+ARG REACT_APP_API_URL=""
+ENV REACT_APP_API_URL=$REACT_APP_API_URL
 RUN npm run build
 
 # Production stage
-FROM nginx:alpine
+# nginx-unprivileged listens on 8080 and runs as a non-root user, which is
+# what lets the Kubernetes securityContext enforce runAsNonRoot.
+FROM nginxinc/nginx-unprivileged:alpine
 
-# Copy built assets from the build stage
 COPY --from=build /app/build /usr/share/nginx/html
-
-# Copy nginx configuration
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
-# Expose port 80
-EXPOSE 80
-
-# Start nginx
-CMD ["nginx", "-g", "daemon off;"]
+EXPOSE 8080

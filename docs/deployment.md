@@ -1,513 +1,264 @@
-# SentryFlow Deployment Guide
+# Deployment
 
-This document provides comprehensive instructions for deploying SentryFlow in various environments, from development to production.
+SentryFlow ships three images — `backend`, `aggregator`, `frontend` — plus a
+Helm chart. Local development runs everything in Docker Compose; production
+runs on EKS with the stateful dependencies moved to managed AWS services.
 
-## Deployment Options
+## Contents
 
-SentryFlow can be deployed in several ways depending on your requirements:
+- [Local development](#local-development)
+- [Container images](#container-images)
+- [Kubernetes](#kubernetes)
+- [AWS / EKS](#aws--eks)
+- [Operations](#operations)
 
-1. **Docker Compose**: Simplest option for small to medium deployments
-2. **Kubernetes**: Recommended for production deployments with high availability requirements
-3. **Manual Deployment**: For custom environments or when containers are not an option
+---
 
-## Prerequisites
+## Local development
 
-Regardless of the deployment method, you'll need:
-
-- PostgreSQL 13+ database
-- Redis 6+ instance
-- Apache Kafka 2.8+ cluster with Zookeeper
-- ClickHouse 21.8+ database
-- Network connectivity between all components
-
-## Docker Compose Deployment
-
-The Docker Compose deployment is the simplest way to get SentryFlow up and running.
-
-### Requirements
-
-- Docker Engine 20.10+
-- Docker Compose 2.0+
-- At least 4GB of RAM
-- At least 20GB of disk space
-
-### Steps
-
-1. **Clone the repository**
+Compose brings up the gateway, aggregator, dashboard and every dependency
+(Postgres, Redis, Kafka in KRaft mode, ClickHouse):
 
 ```bash
-git clone https://github.com/yourusername/sentryflow.git
-cd sentryflow
+SENTRYFLOW_ADMIN_PASSWORD=choose-one docker compose up -d --build
 ```
 
-2. **Configure environment variables**
+| Service | URL |
+| --- | --- |
+| Dashboard | http://localhost |
+| Gateway | http://localhost:8000 |
+| API docs | http://localhost:8000/docs |
+| Kafka UI | http://localhost:8080, with `--profile tools` |
 
-Create `.env` files for each component based on the provided examples:
+Start-up is ordered by health checks. A one-shot `migrate` service runs
+`python -m backend.setup_db` once Postgres is ready; the gateway starts after it
+succeeds and Kafka is healthy (the gateway opens its Kafka producer once, at
+boot). `setup_db` is idempotent: it creates missing tables, applies additive
+upgrades, creates the `admin` account if absent, and seeds a catch-all rate
+limit. Without `SENTRYFLOW_ADMIN_PASSWORD` it generates a password and prints
+it once: `docker compose logs migrate`.
+
+The aggregator creates the ClickHouse table and the Kafka topics itself on
+start-up, so a fresh stack needs no manual steps. Events from a request reach
+the dashboard in about 2–3 seconds.
+
+The dashboard image is built with `REACT_APP_API_URL=""`, so the browser calls
+its own origin, and nginx proxies `/api`, `/auth`, `/health`, `/analytics` and
+`/limits` to the gateway. The ingress routes the same paths in Kubernetes.
+
+If a host port is taken, move it: `BACKEND_PORT`, `DASHBOARD_PORT`,
+`POSTGRES_PORT`, `REDIS_PORT`, `KAFKA_PORT`, `CLICKHOUSE_HTTP_PORT`,
+`CLICKHOUSE_NATIVE_PORT`, `KAFKA_UI_PORT`.
+
+To run without containers, see the repository README. To load-test the stack,
+see [load-testing.md](load-testing.md).
+
+---
+
+## Container images
+
+The backend image installs the package at `/app/backend` and puts `/app` on
+`PYTHONPATH`, because the code imports itself as `backend.*`. All three images
+run as a non-root user so the Kubernetes `securityContext` can enforce
+`runAsNonRoot`.
 
 ```bash
-cp backend/.env.example backend/.env
-cp aggregator/.env.example aggregator/.env
-cp frontend/.env.example frontend/.env
+docker build -t sentryflow-backend:$(git rev-parse --short HEAD) ./backend
+docker build -t sentryflow-aggregator:$(git rev-parse --short HEAD) ./aggregator
+docker build -t sentryflow-frontend:$(git rev-parse --short HEAD) ./frontend
 ```
 
-Edit the `.env` files to match your environment. At minimum, you should set:
+The frontend serves from `nginx-unprivileged` on port **8080**, not 80. Its
+API base URL is baked in at build time (`--build-arg REACT_APP_API_URL=...`);
+the default, empty, means same-origin behind the ingress.
 
-- Database credentials
-- JWT secret key
-- Admin user credentials
+---
 
-3. **Start the services**
+## Kubernetes
+
+The chart lives in [`kubernetes/chart`](../kubernetes/chart).
 
 ```bash
-# Build and start all services
-docker-compose up -d
+helm lint kubernetes/chart --set secrets.postgresPassword=placeholder
 
-# Or use the provided script
-./docker_start.sh
+helm upgrade --install sentryflow ./kubernetes/chart \
+  --namespace sentryflow --create-namespace \
+  --set secrets.postgresPassword="$POSTGRES_PASSWORD" \
+  --set image.tag="$(git rev-parse --short HEAD)"
 ```
 
-On Windows:
+What the chart renders: a backend Deployment + Service + HPA +
+PodDisruptionBudget, an aggregator Deployment, a frontend Deployment +
+Service, a ConfigMap, a Secret, a ServiceAccount, an optional Ingress, and a
+pre-install/pre-upgrade Job that runs `setup_db`.
+
+### Probes
+
+The three health endpoints are deliberately different, and the chart wires
+each to its matching probe:
+
+| Endpoint | Probe | Checks |
+| --- | --- | --- |
+| `/health/live` | liveness, startup | nothing |
+| `/health/ready` | readiness | Postgres, Redis |
+| `/health` | none (operators) | Postgres, Redis, Kafka, with timings |
+
+Liveness intentionally touches no dependency. A liveness probe that checked
+Redis would restart every pod in the fleet during a Redis blip, converting a
+degraded dependency into a full outage. Readiness checks only what is needed
+to answer a request, so an affected pod leaves the Service endpoints and
+rejoins on recovery without a restart.
+
+Kafka is excluded from readiness because usage logging is fire-and-forget —
+the gateway still authenticates, rate limits and serves traffic without it.
+`/health` reports that state as `degraded`.
+
+### Validating changes
+
+Rendered manifests are checked against the real Kubernetes schemas in CI:
 
 ```bash
-.\docker_start.bat
+helm template sentryflow kubernetes/chart \
+  --set secrets.postgresPassword=placeholder --set ingress.enabled=true \
+  | kubeconform -kubernetes-version 1.29.0 -strict -summary
 ```
 
-4. **Initialize the databases**
+---
 
-The initialization scripts should run automatically, but you can also run them manually:
+## AWS / EKS
+
+Production replaces the in-cluster stateful services with managed ones. The
+cluster then runs only stateless workloads, which is what makes the node group
+disposable.
+
+| Component | AWS service |
+| --- | --- |
+| Postgres | RDS for PostgreSQL (Multi-AZ) |
+| Redis | ElastiCache for Redis |
+| Kafka | MSK |
+| Images | ECR |
+| Ingress | ALB via the AWS Load Balancer Controller |
+| Secrets | Secrets Manager, projected by External Secrets Operator |
+| ClickHouse | self-managed on EC2 or EBS-backed StatefulSet |
+
+### 1. Push images to ECR
 
 ```bash
-docker-compose exec backend python setup_db.py
-docker-compose exec aggregator python setup_clickhouse.py
+ACCOUNT=123456789012
+REGION=us-east-1
+REGISTRY=$ACCOUNT.dkr.ecr.$REGION.amazonaws.com
+TAG=$(git rev-parse --short HEAD)
+
+aws ecr get-login-password --region $REGION \
+  | docker login --username AWS --password-stdin $REGISTRY
+
+for svc in backend aggregator frontend; do
+  docker build -t $REGISTRY/sentryflow-$svc:$TAG ./$svc
+  docker push $REGISTRY/sentryflow-$svc:$TAG
+done
 ```
 
-5. **Verify the deployment**
+Tag with the commit SHA rather than `latest`, so a rollback is a redeploy of a
+known tag and the HPA never pulls a different image mid-scale-up.
 
-Access the following URLs to verify that all components are running:
+### 2. Credentials via IRSA
 
-- Frontend: http://localhost:3000
-- Backend API: http://localhost:8000
-- API Documentation: http://localhost:8000/docs
-- Kafka UI: http://localhost:8080
+Pods assume an IAM role instead of holding static keys. Annotate the
+ServiceAccount (already templated in `values-production.yaml`):
 
-### Scaling with Docker Compose
+```yaml
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/sentryflow-app
+```
 
-For higher load, you can scale the backend and aggregator services:
+### 3. Secrets
+
+Nothing sensitive belongs in Git or in `--set`. Store the database password,
+JWT signing key and ClickHouse credentials in Secrets Manager and let External
+Secrets Operator project them into a Kubernetes Secret named
+`sentryflow-secrets`; the chart then consumes it via `secrets.existingSecret`.
+The gateway only reads ClickHouse, so give it a user with read access; the
+aggregator needs insert and create on the `sentryflow` database.
+
+#### Kafka topics on MSK
+
+MSK disables topic auto-creation by default. The aggregator creates
+`api-requests` and `rate-limited-events` on start-up if it is allowed to
+(`aggregator.topicPartitions`, `aggregator.topicReplication`: 3 and 3 in
+`values-production.yaml`). If your ACLs forbid that, create them beforehand;
+the aggregator logs a warning and carries on when creation is refused.
+
+The application refuses to start when `ENVIRONMENT=production` and
+`JWT_SECRET` is unset, rather than falling back to a guessable default.
+
+### 4. Deploy
 
 ```bash
-docker-compose up -d --scale backend=3 --scale aggregator=2
+aws eks update-kubeconfig --name sentryflow --region $REGION
+
+helm upgrade --install sentryflow ./kubernetes/chart \
+  --namespace sentryflow --create-namespace \
+  -f ./kubernetes/chart/values-production.yaml \
+  --set image.tag=$TAG \
+  --wait --timeout 10m
 ```
 
-Note that this requires configuring a load balancer in front of the backend services.
+`--wait` blocks until the new pods pass their readiness probes, so a failed
+rollout surfaces in the pipeline rather than in production traffic.
 
-## Kubernetes Deployment
-
-For production deployments with high availability requirements, Kubernetes is recommended.
-
-### Requirements
-
-- Kubernetes cluster 1.19+
-- Helm 3.0+
-- kubectl configured to access your cluster
-- Persistent storage for databases
-
-### Steps
-
-1. **Clone the repository**
+### 5. Verify
 
 ```bash
-git clone https://github.com/yourusername/sentryflow.git
-cd sentryflow/kubernetes
+kubectl -n sentryflow get pods -w
+kubectl -n sentryflow exec deploy/sentryflow-backend -- \
+  python -c "import urllib.request,json; print(json.load(urllib.request.urlopen('http://localhost:8000/health')))"
 ```
 
-2. **Configure Helm values**
+---
 
-Edit the `values.yaml` file to match your environment. At minimum, you should set:
+## Operations
 
-- Database connection details
-- JWT secret key
-- Admin user credentials
-- Resource requests and limits
-- Persistent volume configurations
-
-3. **Deploy with Helm**
+### Rollback
 
 ```bash
-helm install sentryflow ./chart
+helm rollback sentryflow --namespace sentryflow
 ```
 
-4. **Wait for all pods to be ready**
+The migration job only adds tables, columns and indexes and seeds absent
+rows, so rolling the application back does not require a schema rollback.
+
+### Administrators
+
+The migration job creates `admin`. To promote another account:
 
 ```bash
-kubectl get pods -w
+kubectl -n sentryflow exec deploy/sentryflow-backend -- \
+  python -m backend.setup_db --grant-admin alice
 ```
 
-5. **Initialize the databases**
+An existing account that happens to be named `admin` is never promoted
+automatically: it could have come through public sign-up.
+
+### Scaling
+
+The backend is I/O bound — it awaits Redis and Postgres rather than burning
+CPU — so it scales on CPU utilisation with a deliberately slow scale-down
+(300s stabilisation) to avoid thrashing on spiky traffic.
+
+The aggregator is a Kafka consumer group: replicas beyond the topic's
+partition count sit idle. Scale partitions first, then replicas.
+
+### Rate limiter behaviour during a Redis outage
+
+`RATE_LIMIT_FAIL_OPEN` defaults to `true`: if Redis is unreachable, requests
+are served without enforcement. Losing the limiter degrades enforcement rather
+than causing an API outage. Set it to `false` where over-admission is worse
+than unavailability.
+
+### Logs
 
 ```bash
-kubectl exec -it $(kubectl get pods -l app=sentryflow-backend -o jsonpath='{.items[0].metadata.name}') -- python setup_db.py
-kubectl exec -it $(kubectl get pods -l app=sentryflow-aggregator -o jsonpath='{.items[0].metadata.name}') -- python setup_clickhouse.py
+kubectl -n sentryflow logs -l app.kubernetes.io/component=backend --tail=100 -f
+kubectl -n sentryflow logs -l app.kubernetes.io/component=aggregator --tail=100 -f
 ```
-
-6. **Access the services**
-
-Get the external IP or hostname for the frontend service:
-
-```bash
-kubectl get service sentryflow-frontend
-```
-
-Access the frontend using the external IP or hostname.
-
-### High Availability Configuration
-
-The Kubernetes deployment is designed for high availability:
-
-- Multiple replicas of backend and aggregator services
-- Pod anti-affinity to distribute replicas across nodes
-- Readiness and liveness probes for automatic recovery
-- Horizontal Pod Autoscaling based on CPU and memory usage
-
-You can adjust the high availability settings in the `values.yaml` file.
-
-## Manual Deployment
-
-For environments where containers are not an option, you can deploy SentryFlow manually.
-
-### Requirements
-
-- Python 3.9+
-- Node.js 16+
-- PostgreSQL 13+
-- Redis 6+
-- Apache Kafka 2.8+ with Zookeeper
-- ClickHouse 21.8+
-- Nginx or another web server
-
-### Steps
-
-1. **Clone the repository**
-
-```bash
-git clone https://github.com/yourusername/sentryflow.git
-cd sentryflow
-```
-
-2. **Set up the backend**
-
-```bash
-cd backend
-
-# Create a virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Configure environment variables
-cp .env.example .env
-# Edit .env with your configuration
-
-# Initialize the database
-python setup_db.py
-
-# Start the backend service
-uvicorn main:app --host 0.0.0.0 --port 8000
-```
-
-3. **Set up the aggregator**
-
-```bash
-cd aggregator
-
-# Create a virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Configure environment variables
-cp .env.example .env
-# Edit .env with your configuration
-
-# Initialize ClickHouse
-python setup_clickhouse.py
-
-# Start the aggregator service
-python batch_consumer.py
-```
-
-4. **Set up the frontend**
-
-```bash
-cd frontend
-
-# Install dependencies
-npm install
-
-# Configure environment variables
-cp .env.example .env
-# Edit .env with your configuration
-
-# Build the frontend
-npm run build
-
-# Serve the frontend with Nginx or another web server
-# Copy the build directory to your web server's document root
-```
-
-5. **Configure Nginx**
-
-Create an Nginx configuration file for the frontend and backend:
-
-```nginx
-server {
-    listen 80;
-    server_name your-sentryflow-domain.com;
-
-    # Frontend
-    location / {
-        root /path/to/sentryflow/frontend/build;
-        try_files $uri $uri/ /index.html;
-    }
-
-    # Backend API
-    location /api/ {
-        proxy_pass http://localhost:8000/;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-
-    # Backend health check
-    location /health {
-        proxy_pass http://localhost:8000/health;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-}
-```
-
-6. **Set up systemd services**
-
-Create systemd service files for the backend and aggregator:
-
-```ini
-# /etc/systemd/system/sentryflow-backend.service
-[Unit]
-Description=SentryFlow Backend Service
-After=network.target
-
-[Service]
-User=sentryflow
-WorkingDirectory=/path/to/sentryflow/backend
-EnvironmentFile=/path/to/sentryflow/backend/.env
-ExecStart=/path/to/sentryflow/backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```ini
-# /etc/systemd/system/sentryflow-aggregator.service
-[Unit]
-Description=SentryFlow Aggregator Service
-After=network.target
-
-[Service]
-User=sentryflow
-WorkingDirectory=/path/to/sentryflow/aggregator
-EnvironmentFile=/path/to/sentryflow/aggregator/.env
-ExecStart=/path/to/sentryflow/aggregator/venv/bin/python batch_consumer.py
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable and start the services:
-
-```bash
-systemctl enable sentryflow-backend.service
-systemctl start sentryflow-backend.service
-systemctl enable sentryflow-aggregator.service
-systemctl start sentryflow-aggregator.service
-```
-
-## Production Considerations
-
-### Security
-
-1. **Use HTTPS**: Always use HTTPS in production. Configure SSL certificates for your web server.
-
-2. **Secure Secrets**: Store sensitive information like database credentials and JWT secrets securely. Consider using a secret management solution like HashiCorp Vault or Kubernetes Secrets.
-
-3. **Network Security**: Use network policies or firewall rules to restrict access between components.
-
-4. **Regular Updates**: Keep all components updated with security patches.
-
-### Performance
-
-1. **Database Optimization**: Tune PostgreSQL and ClickHouse for your workload.
-
-2. **Caching**: Configure Redis caching appropriately for your usage patterns.
-
-3. **Load Balancing**: Use a load balancer in front of multiple backend instances.
-
-4. **Resource Allocation**: Allocate appropriate CPU and memory resources based on expected load.
-
-### Monitoring
-
-1. **Health Checks**: Use the `/health`, `/ready`, and `/live` endpoints to monitor service health.
-
-2. **Metrics**: Set up Prometheus and Grafana for monitoring system metrics.
-
-3. **Logging**: Configure centralized logging with ELK stack or similar.
-
-4. **Alerts**: Set up alerts for critical issues like service unavailability or high error rates.
-
-### Backup and Recovery
-
-1. **Database Backups**: Regularly back up PostgreSQL and ClickHouse databases.
-
-2. **Configuration Backups**: Back up all configuration files and environment variables.
-
-3. **Disaster Recovery Plan**: Develop and test a disaster recovery plan.
-
-## Upgrading
-
-### Docker Compose Upgrade
-
-1. Pull the latest changes:
-
-```bash
-git pull
-```
-
-2. Rebuild and restart the services:
-
-```bash
-docker-compose down
-docker-compose build
-docker-compose up -d
-```
-
-### Kubernetes Upgrade
-
-1. Update the Helm chart:
-
-```bash
-git pull
-helm upgrade sentryflow ./kubernetes/chart
-```
-
-### Manual Upgrade
-
-1. Pull the latest changes:
-
-```bash
-git pull
-```
-
-2. Update dependencies:
-
-```bash
-cd backend
-source venv/bin/activate
-pip install -r requirements.txt
-
-cd ../aggregator
-source venv/bin/activate
-pip install -r requirements.txt
-
-cd ../frontend
-npm install
-npm run build
-```
-
-3. Apply database migrations (if any):
-
-```bash
-cd backend
-python setup_db.py
-
-cd ../aggregator
-python setup_clickhouse.py
-```
-
-4. Restart the services:
-
-```bash
-systemctl restart sentryflow-backend.service
-systemctl restart sentryflow-aggregator.service
-```
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Database Connection Errors**:
-   - Verify database credentials in environment variables
-   - Check network connectivity to the database
-   - Ensure the database server is running
-
-2. **Kafka Connection Issues**:
-   - Verify Kafka broker addresses in environment variables
-   - Check network connectivity to Kafka
-   - Ensure Kafka topics exist
-
-3. **Frontend Not Loading**:
-   - Check Nginx configuration
-   - Verify that the frontend build was successful
-   - Check browser console for JavaScript errors
-
-4. **Backend API Errors**:
-   - Check backend logs for error messages
-   - Verify environment variables
-   - Check database connectivity
-
-### Diagnostic Tools
-
-1. **Health Check Script**:
-
-Use the provided health check script to verify all components:
-
-```bash
-python scripts/check_health.py
-```
-
-2. **Log Analysis**:
-
-Check logs for error messages:
-
-```bash
-# Docker Compose
-docker-compose logs backend
-docker-compose logs aggregator
-
-# Kubernetes
-kubectl logs -l app=sentryflow-backend
-kubectl logs -l app=sentryflow-aggregator
-
-# Manual Deployment
-journalctl -u sentryflow-backend.service
-journalctl -u sentryflow-aggregator.service
-```
-
-3. **Database Verification**:
-
-Verify database schema and connectivity:
-
-```bash
-# PostgreSQL
-psql -h <host> -U <user> -d sentryflow -c "\dt"
-
-# ClickHouse
-clickhouse-client --host <host> --query "SHOW TABLES FROM sentryflow"
-```
-
-## Conclusion
-
-This deployment guide covers the most common deployment scenarios for SentryFlow. For specific requirements or custom deployments, please refer to the component-specific documentation or contact the development team.

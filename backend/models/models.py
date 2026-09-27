@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, Text
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, Index, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -15,6 +15,9 @@ class User(Base):
     username = Column(String(50), unique=True, index=True)
     hashed_password = Column(String(255))
     is_active = Column(Boolean, default=True)
+    # Operators see every user's traffic and manage rate limits. Nobody can
+    # sign up as one; setup_db grants it to the seeded admin account.
+    is_admin = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -40,6 +43,11 @@ class ApiKey(Base):
 
 class RateLimit(Base):
     __tablename__ = "rate_limits"
+    # One rule per (user, endpoint). The limiter resolves a request with
+    # `.first()`, so a duplicate would be silently ignored rather than applied.
+    __table_args__ = (
+        Index("uq_rate_limits_user_endpoint", "user_id", "endpoint", unique=True),
+    )
 
     id = Column(String(36), primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String(36), ForeignKey("users.id"))

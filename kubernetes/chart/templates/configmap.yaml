@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sentryflow.fullname" . }}-config
+  labels:
+    {{- include "sentryflow.labels" . | nindent 4 }}
+data:
+  environment: {{ .Values.config.environment | quote }}
+  logLevel: {{ .Values.config.logLevel | quote }}
+  corsOrigins: {{ .Values.config.corsOrigins | quote }}
+  defaultRateLimit: {{ .Values.config.defaultRateLimit | quote }}
+  defaultRateLimitWindow: {{ .Values.config.defaultRateLimitWindow | quote }}
+  defaultRateLimitAlgorithm: {{ .Values.config.defaultRateLimitAlgorithm | quote }}
+  defaultBurstCapacity: {{ .Values.config.defaultBurstCapacity | quote }}
+  rateLimitFailOpen: {{ .Values.config.rateLimitFailOpen | quote }}
+  accessTokenExpireMinutes: {{ .Values.config.accessTokenExpireMinutes | quote }}
+  refreshTokenExpireDays: {{ .Values.config.refreshTokenExpireDays | quote }}
+  kafkaBootstrapServers: {{ .Values.externalServices.kafkaBootstrapServers | quote }}
+  clickhouseHost: {{ .Values.externalServices.clickhouseHost | quote }}
+  clickhousePort: {{ .Values.externalServices.clickhousePort | quote }}
+  clickhouseDatabase: {{ .Values.externalServices.clickhouseDatabase | quote }}

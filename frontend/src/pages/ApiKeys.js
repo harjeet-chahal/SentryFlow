@@ -1,285 +1,259 @@
-import React, { useState, useEffect } from 'react';
-import { useAuth } from '../components/auth/AuthContext';
-import { format } from 'date-fns';
+import React, { useCallback, useMemo, useState } from 'react';
+import { useAuth, publicApiUrl } from '../components/auth/AuthContext';
+import CopyButton from '../components/CopyButton';
+import { PageHeader, PageSpinner, ErrorState, Badge } from '../components/ui';
+import { formatDateTime, formatRelative, maskKey, parseApiDate } from '../utils/analytics';
+import { getJson, apiErrorMessage } from '../utils/api';
+import usePolling from '../utils/usePolling';
+
+const th = 'px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider';
+const td = 'px-4 py-4 whitespace-nowrap text-sm text-gray-500';
+// Keeps the table within the card on narrower screens.
+const xlOnly = 'hidden xl:table-cell';
+
+const createdTime = (key) => parseApiDate(key.created_at)?.getTime() ?? 0;
+
+// Active keys first, newest first within each group.
+const sortKeys = (keys) =>
+  [...keys].sort((a, b) => {
+    if (a.is_active !== b.is_active) return a.is_active ? -1 : 1;
+    return createdTime(b) - createdTime(a);
+  });
+
+const NewKeyBanner = ({ apiKey, onDismiss }) => (
+  <div className="mb-4 rounded-md bg-green-50 p-4" role="status">
+    <h3 className="text-sm font-medium text-green-800">API key “{apiKey.name}” created</h3>
+    <p className="mt-1 text-sm text-green-700">
+      Copy it now and store it somewhere safe: anyone with this key can call the API as you.
+    </p>
+    <div className="mt-3 flex flex-wrap items-center gap-3">
+      <code className="break-all rounded bg-white px-3 py-2 font-mono text-sm text-gray-900 border border-green-200">
+        {apiKey.key}
+      </code>
+      <CopyButton text={apiKey.key} label="Copy key" />
+    </div>
+    <p className="mt-3 text-sm text-green-700">Try it:</p>
+    <pre className="mt-1 overflow-x-auto rounded-md bg-gray-900 p-3 text-xs text-gray-100">
+      <code>{`curl -H "x-api-key: ${apiKey.key}" ${publicApiUrl('/api/v1/hello')}`}</code>
+    </pre>
+    <button
+      type="button"
+      className="mt-3 text-sm font-medium text-green-800 hover:text-green-700"
+      onClick={onDismiss}
+    >
+      Dismiss
+    </button>
+  </div>
+);
 
 const ApiKeys = () => {
   const { authAxios } = useAuth();
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [apiKeys, setApiKeys] = useState([]);
   const [newKeyName, setNewKeyName] = useState('');
-  const [showNewKey, setShowNewKey] = useState(null);
+  const [creating, setCreating] = useState(false);
   const [createKeyError, setCreateKeyError] = useState(null);
-  
-  // Fetch API keys
-  useEffect(() => {
-    const fetchApiKeys = async () => {
-      try {
-        setLoading(true);
-        setError(null);
-        
-        // In a real app, this would be an actual API call
-        // const response = await authAxios.get('/auth/apikeys');
-        // setApiKeys(response.data);
-        
-        // For demo purposes, we'll use mock data
-        const mockApiKeys = [
-          {
-            id: '1',
-            key: 'sk_test_51JKj7rLkjhgfdsa987654321qwerty',
-            name: 'Production API Key',
-            created_at: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000), // 30 days ago
-            last_used_at: new Date(Date.now() - 2 * 60 * 60 * 1000), // 2 hours ago
-            is_active: true
-          },
-          {
-            id: '2',
-            key: 'sk_test_51JKj7rPoiuytrewq123456789asdfgh',
-            name: 'Development API Key',
-            created_at: new Date(Date.now() - 15 * 24 * 60 * 60 * 1000), // 15 days ago
-            last_used_at: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000), // 5 days ago
-            is_active: true
-          },
-          {
-            id: '3',
-            key: 'sk_test_51JKj7rZxcvbnmlkjhgfdsaqwertyui',
-            name: 'Testing API Key',
-            created_at: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000), // 60 days ago
-            last_used_at: null,
-            is_active: false
-          }
-        ];
-        
-        setApiKeys(mockApiKeys);
-      } catch (err) {
-        console.error('Error fetching API keys:', err);
-        setError('Failed to load API keys');
-      } finally {
-        setLoading(false);
-      }
-    };
-    
-    fetchApiKeys();
-  }, [authAxios]);
-  
+  const [createdKey, setCreatedKey] = useState(null);
+  const [revealed, setRevealed] = useState({});
+  const [revokingId, setRevokingId] = useState(null);
+  const [actionError, setActionError] = useState(null);
+
+  const fetchKeys = useCallback((signal) => getJson(authAxios, '/auth/apikeys', { signal }), [authAxios]);
+  const { data, error, loading, refreshing, refresh } = usePolling(fetchKeys);
+  const apiKeys = useMemo(() => sortKeys(Array.isArray(data) ? data : []), [data]);
+
   // Create new API key
   const handleCreateKey = async (e) => {
     e.preventDefault();
-    
-    if (!newKeyName.trim()) {
+
+    const name = newKeyName.trim();
+    if (!name) {
       setCreateKeyError('API key name is required');
       return;
     }
-    
+
+    setCreating(true);
+    setCreateKeyError(null);
     try {
-      setCreateKeyError(null);
-      
-      // In a real app, this would be an actual API call
-      // const response = await authAxios.post('/auth/apikeys/create', { name: newKeyName });
-      // const newKey = response.data;
-      
-      // For demo purposes, we'll create a mock key
-      const newKey = {
-        id: `${apiKeys.length + 1}`,
-        key: `sk_test_${Math.random().toString(36).substring(2, 15)}${Math.random().toString(36).substring(2, 15)}`,
-        name: newKeyName,
-        created_at: new Date(),
-        last_used_at: null,
-        is_active: true
-      };
-      
-      // Show the new key to the user (only shown once)
-      setShowNewKey(newKey);
-      
-      // Add to the list
-      setApiKeys([newKey, ...apiKeys]);
-      
-      // Clear the form
+      const response = await authAxios.post('/auth/apikeys/create', { name });
+      setCreatedKey(response.data);
       setNewKeyName('');
+      refresh();
     } catch (err) {
       console.error('Error creating API key:', err);
-      setCreateKeyError('Failed to create API key');
+      setCreateKeyError(apiErrorMessage(err));
+    } finally {
+      setCreating(false);
     }
   };
-  
-  // Toggle API key status (active/inactive)
-  const handleToggleKeyStatus = async (keyId) => {
-    try {
-      // Find the key to toggle
-      const keyIndex = apiKeys.findIndex(key => key.id === keyId);
-      if (keyIndex === -1) return;
-      
-      // In a real app, this would be an actual API call
-      // await authAxios.put(`/auth/apikeys/${keyId}/toggle`);
-      
-      // Update the local state
-      const updatedKeys = [...apiKeys];
-      updatedKeys[keyIndex] = {
-        ...updatedKeys[keyIndex],
-        is_active: !updatedKeys[keyIndex].is_active
-      };
-      
-      setApiKeys(updatedKeys);
-    } catch (err) {
-      console.error('Error toggling API key status:', err);
-      setError('Failed to update API key');
-    }
-  };
-  
-  // Format date for display
-  const formatDate = (date) => {
-    if (!date) return 'Never';
-    return format(new Date(date), 'MMM d, yyyy h:mm a');
-  };
-  
-  // Mask API key for display
-  const maskApiKey = (key) => {
-    if (!key) return '';
-    return `${key.substring(0, 8)}...${key.substring(key.length - 4)}`;
-  };
-  
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center h-full">
-        <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500"></div>
-      </div>
+
+  // Revoke an API key (the row stays, marked as revoked)
+  const handleRevoke = async (apiKey) => {
+    const confirmed = window.confirm(
+      `Revoke “${apiKey.name}”? Requests using this key will be rejected immediately. This can't be undone.`
     );
-  }
-  
+    if (!confirmed) return;
+
+    setRevokingId(apiKey.id);
+    setActionError(null);
+    try {
+      await authAxios.delete(`/auth/apikeys/${apiKey.id}`);
+      if (createdKey?.id === apiKey.id) setCreatedKey(null);
+      refresh();
+    } catch (err) {
+      console.error('Error revoking API key:', err);
+      setActionError(apiErrorMessage(err));
+    } finally {
+      setRevokingId(null);
+    }
+  };
+
+  const toggleReveal = (id) => setRevealed((prev) => ({ ...prev, [id]: !prev[id] }));
+
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold text-gray-900">API Keys</h1>
-      </div>
-      
+      <PageHeader
+        title="API Keys"
+        subtitle={<span>Send a key in the x-api-key header to call the API through the gateway.</span>}
+      />
+
       {/* Create new API key form */}
       <div className="bg-white shadow rounded-lg p-6">
         <h2 className="text-lg font-medium text-gray-900 mb-4">Create New API Key</h2>
-        
+
         {createKeyError && (
-          <div className="mb-4 rounded-md bg-red-50 p-4">
-            <div className="flex">
-              <div className="ml-3">
-                <h3 className="text-sm font-medium text-red-800">{createKeyError}</h3>
-              </div>
-            </div>
+          <div className="mb-4 rounded-md bg-red-50 p-4" role="alert">
+            <h3 className="text-sm font-medium text-red-800">{createKeyError}</h3>
           </div>
         )}
-        
-        {showNewKey && (
-          <div className="mb-4 rounded-md bg-green-50 p-4">
-            <div className="flex">
-              <div className="ml-3">
-                <h3 className="text-sm font-medium text-green-800">API Key Created Successfully</h3>
-                <div className="mt-2 text-sm text-green-700">
-                  <p>Your new API key: <span className="font-mono">{showNewKey.key}</span></p>
-                  <p className="mt-1 text-xs text-red-600 font-semibold">This is the only time you'll see this key. Please copy it now.</p>
-                </div>
-                <div className="mt-4">
-                  <button
-                    type="button"
-                    className="text-sm font-medium text-green-800 hover:text-green-700"
-                    onClick={() => setShowNewKey(null)}
-                  >
-                    Dismiss
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-        
+
+        {createdKey && <NewKeyBanner apiKey={createdKey} onDismiss={() => setCreatedKey(null)} />}
+
         <form onSubmit={handleCreateKey} className="space-y-4">
           <div>
-            <label htmlFor="key-name" className="block text-sm font-medium text-gray-700">Key Name</label>
+            <label htmlFor="key-name" className="block text-sm font-medium text-gray-700">
+              Key Name
+            </label>
             <input
               type="text"
               id="key-name"
-              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
+              className="form-input mt-1 sm:text-sm"
               placeholder="e.g., Production API Key"
               value={newKeyName}
               onChange={(e) => setNewKeyName(e.target.value)}
             />
           </div>
-          
+
           <div>
             <button
               type="submit"
-              className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+              disabled={creating}
+              className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50"
             >
-              Create API Key
+              {creating ? 'Creating…' : 'Create API Key'}
             </button>
           </div>
         </form>
       </div>
-      
+
       {/* API keys list */}
       <div className="bg-white shadow rounded-lg overflow-hidden">
         <div className="px-4 py-5 sm:px-6">
           <h2 className="text-lg font-medium text-gray-900">Your API Keys</h2>
-          <p className="mt-1 text-sm text-gray-500">Manage your existing API keys</p>
+          <p className="mt-1 text-sm text-gray-500">
+            Revoked keys stay listed for reference but no longer authenticate requests.
+          </p>
         </div>
-        
-        {error && (
-          <div className="mx-4 mb-4 rounded-md bg-red-50 p-4">
-            <div className="flex">
-              <div className="ml-3">
-                <h3 className="text-sm font-medium text-red-800">{error}</h3>
-              </div>
-            </div>
+
+        {actionError && (
+          <div className="mx-4 mb-4 rounded-md bg-red-50 p-4" role="alert">
+            <h3 className="text-sm font-medium text-red-800">{actionError}</h3>
           </div>
         )}
-        
-        <div className="border-t border-gray-200 px-4 py-5 sm:p-0">
-          <dl className="sm:divide-y sm:divide-gray-200">
-            {apiKeys.length === 0 ? (
-              <div className="py-4 sm:py-5 sm:grid sm:grid-cols-3 sm:gap-4 sm:px-6">
-                <dt className="text-sm font-medium text-gray-500">No API keys found</dt>
-                <dd className="mt-1 text-sm text-gray-900 sm:mt-0 sm:col-span-2">
-                  Create your first API key using the form above.
-                </dd>
-              </div>
-            ) : (
-              apiKeys.map((key) => (
-                <div key={key.id} className="py-4 sm:py-5 sm:grid sm:grid-cols-3 sm:gap-4 sm:px-6">
-                  <dt className="text-sm font-medium text-gray-500">
-                    <div className="font-semibold">{key.name}</div>
-                    <div className="mt-1 text-xs text-gray-400">
-                      Created: {formatDate(key.created_at)}
-                    </div>
-                  </dt>
-                  <dd className="mt-1 text-sm text-gray-900 sm:mt-0 sm:col-span-2">
-                    <div className="flex justify-between">
-                      <div>
-                        <div className="font-mono">{maskApiKey(key.key)}</div>
-                        <div className="mt-1 text-xs text-gray-500">
-                          Last used: {formatDate(key.last_used_at)}
+
+        <div className="border-t border-gray-200">
+          {loading && <PageSpinner />}
+
+          {!data && error && (
+            <div className="p-4">
+              <ErrorState error={error} onRetry={refresh} retrying={refreshing} />
+            </div>
+          )}
+
+          {data && error && (
+            <p className="px-6 py-3 text-sm text-amber-800 bg-amber-50" role="status">
+              Couldn't refresh the list ({apiErrorMessage(error)}); it may be out of date.
+            </p>
+          )}
+
+          {data && apiKeys.length === 0 && (
+            <p className="px-6 py-5 text-sm text-gray-500">
+              No API keys yet. Create your first one using the form above.
+            </p>
+          )}
+
+          {apiKeys.length > 0 && (
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th scope="col" className={th}>Name</th>
+                    <th scope="col" className={th}>Key</th>
+                    <th scope="col" className={`${th} ${xlOnly}`}>Created</th>
+                    <th scope="col" className={th}>Last used</th>
+                    <th scope="col" className={th}>Status</th>
+                    <th scope="col" className={th}>
+                      <span className="sr-only">Actions</span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                  {apiKeys.map((apiKey) => (
+                    <tr key={apiKey.id} className={apiKey.is_active ? '' : 'bg-gray-50'}>
+                      <td className={`${td} font-medium ${apiKey.is_active ? 'text-gray-900' : 'text-gray-500'}`}>
+                        {apiKey.name}
+                      </td>
+                      {/* No nowrap here, so a revealed key wraps instead of widening the table. */}
+                      <td className="px-4 py-4 text-sm text-gray-500">
+                        <div className="flex items-center gap-3">
+                          <code
+                            className={`min-w-0 font-mono break-all ${apiKey.is_active ? 'text-gray-900' : 'text-gray-400 line-through'}`}
+                          >
+                            {revealed[apiKey.id] ? apiKey.key : maskKey(apiKey.key)}
+                          </code>
+                          <button
+                            type="button"
+                            onClick={() => toggleReveal(apiKey.id)}
+                            className="text-sm font-medium text-blue-600 hover:text-blue-500"
+                          >
+                            {revealed[apiKey.id] ? 'Hide' : 'Reveal'}
+                          </button>
+                          <CopyButton text={apiKey.key} />
                         </div>
-                      </div>
-                      <div className="flex items-center">
-                        <span
-                          className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
-                            key.is_active
-                              ? 'bg-green-100 text-green-800'
-                              : 'bg-red-100 text-red-800'
-                          }`}
-                        >
-                          {key.is_active ? 'Active' : 'Inactive'}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => handleToggleKeyStatus(key.id)}
-                          className="ml-4 text-sm font-medium text-blue-600 hover:text-blue-500"
-                        >
-                          {key.is_active ? 'Deactivate' : 'Activate'}
-                        </button>
-                      </div>
-                    </div>
-                  </dd>
-                </div>
-              ))
-            )}
-          </dl>
+                      </td>
+                      <td className={`${td} ${xlOnly}`}>{formatDateTime(apiKey.created_at, 'MMM d, yyyy')}</td>
+                      <td className={td} title={apiKey.last_used_at ? formatDateTime(apiKey.last_used_at) : undefined}>
+                        {apiKey.last_used_at ? formatRelative(parseApiDate(apiKey.last_used_at)) : 'Never'}
+                      </td>
+                      <td className={td}>
+                        {apiKey.is_active ? <Badge tone="green">Active</Badge> : <Badge tone="red">Revoked</Badge>}
+                      </td>
+                      <td className={`${td} text-right`}>
+                        {apiKey.is_active && (
+                          <button
+                            type="button"
+                            onClick={() => handleRevoke(apiKey)}
+                            disabled={revokingId === apiKey.id}
+                            className="text-sm font-medium text-red-600 hover:text-red-500 disabled:text-gray-400"
+                          >
+                            {revokingId === apiKey.id ? 'Revoking…' : 'Revoke'}
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       </div>
     </div>

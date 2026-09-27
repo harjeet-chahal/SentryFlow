@@ -14,18 +14,24 @@ import {
 
 const DashboardLayout = () => {
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const { user, logout } = useAuth();
+  const { user, isAdmin, logout } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
   
-  // Navigation items
+  // Navigation items (per-user analytics is for administrators only)
   const navigation = [
     { name: 'Dashboard', href: '/', icon: HomeIcon },
-    { name: 'User View', href: '/users', icon: UsersIcon },
+    { name: 'User View', href: '/users', icon: UsersIcon, adminOnly: true },
     { name: 'Rate Limit Monitor', href: '/rate-limits', icon: ShieldExclamationIcon },
     { name: 'Logs Explorer', href: '/logs', icon: DocumentTextIcon },
     { name: 'API Keys', href: '/api-keys', icon: KeyIcon },
-  ];
+  ].filter((item) => isAdmin || !item.adminOnly);
+
+  const adminBadge = isAdmin && (
+    <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800">
+      Admin
+    </span>
+  );
   
   // Handle logout
   const handleLogout = () => {
@@ -92,8 +98,9 @@ const DashboardLayout = () => {
                       </div>
                     </div>
                     <div className="ml-3">
-                      <p className="text-base font-medium text-gray-700 group-hover:text-gray-900">
+                      <p className="flex items-center text-base font-medium text-gray-700 group-hover:text-gray-900">
                         {user?.username || 'User'}
+                        {adminBadge}
                       </p>
                       <button
                         onClick={handleLogout}
@@ -164,8 +171,9 @@ const DashboardLayout = () => {
                   </div>
                 </div>
                 <div className="ml-3">
-                  <p className="text-sm font-medium text-gray-700 group-hover:text-gray-900">
+                  <p className="flex items-center text-sm font-medium text-gray-700 group-hover:text-gray-900">
                     {user?.username || 'User'}
+                    {adminBadge}
                   </p>
                   <button
                     onClick={handleLogout}
