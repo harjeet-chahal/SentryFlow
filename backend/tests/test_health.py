@@ -62,6 +62,24 @@ def test_health_is_degraded_not_unhealthy_without_kafka(client):
     body = response.json()
     assert body["status"] == "degraded"
     assert body["components"]["kafka"]["status"] == "unavailable"
+    assert body["components"]["kafka"]["detail"] == "Connecting to Kafka"
+
+
+def test_health_reports_usage_events_kafka_refused(client, api_key, fake_kafka, published):
+    """Connected is not enough: a broker that stops taking events is degraded too."""
+    fake_kafka.fail = True
+    client.get("/api/v1/hello", headers={"x-api-key": api_key["key"]})
+    published()
+
+    body = client.get("/health").json()
+    assert body["status"] == "degraded"
+    assert body["components"]["kafka"] == {
+        "status": "unavailable",
+        "detail": "Kafka is not accepting events",
+        "queued": 0,
+        "dropped": 0,
+        "failed": 1,
+    }
 
 
 def test_health_is_503_when_a_critical_component_is_down(client):

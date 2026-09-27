@@ -32,7 +32,8 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_started
-      # The gateway starts its Kafka producer once, at boot.
+      # Not required: the gateway connects to Kafka whenever it arrives.
+      # Waiting keeps the start-up log free of connection retries.
       kafka:
         condition: service_healthy
     environment: *backend-env

@@ -17,9 +17,11 @@ so they are deliberately not the same check:
     /health        Operator-facing detail: per-component status and timings,
                    including non-critical dependencies. Not used as a probe.
 
-Kafka is deliberately non-critical. Usage logging is fire-and-forget, so the
-gateway can authenticate, rate limit and serve while Kafka is down; that
-state is reported as "degraded" rather than failing readiness.
+Kafka is deliberately non-critical. Requests only queue their usage events
+and a background task publishes them, so the gateway can authenticate, rate
+limit and serve while Kafka is down; that state is reported as "degraded"
+rather than failing readiness. The task reconnects on its own, so there is
+nothing a restart would fix.
 """
 import logging
 import time
@@ -29,7 +31,7 @@ from fastapi import APIRouter, Response, status
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import text
 
-from backend.middlewares.logging_middleware import get_producer
+from backend.middlewares import logging_middleware
 from backend.redis_client import get_redis
 
 logger = logging.getLogger(__name__)
@@ -75,15 +77,19 @@ async def check_redis() -> Dict[str, Any]:
 
 
 async def check_kafka() -> Dict[str, Any]:
-    """Report producer availability.
+    """Report whether usage events are reaching Kafka.
 
-    aiokafka reconnects internally, so the meaningful signal here is whether
-    a producer was ever established, not a synchronous broker round-trip.
+    Built from what the publisher has seen rather than a broker round-trip:
+    whether it is connected, and whether its latest delivery succeeded. The
+    counters say how many events are waiting and how many were lost.
     """
-    producer = get_producer()
-    if producer is None:
-        return {"status": "unavailable", "detail": "Producer not started; usage logging disabled"}
-    return {"status": "healthy"}
+    publisher = logging_middleware.status()
+    counts = {key: publisher[key] for key in ("queued", "dropped", "failed")}
+    if not publisher["connected"]:
+        return {"status": "unavailable", "detail": "Connecting to Kafka", **counts}
+    if not publisher["delivering"]:
+        return {"status": "unavailable", "detail": "Kafka is not accepting events", **counts}
+    return {"status": "healthy", **counts}
 
 
 @router.get("", summary="Full system health")

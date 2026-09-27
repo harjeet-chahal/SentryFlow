@@ -11,8 +11,8 @@ dashboard computes everything from those rows at query time.
 
 ## 1. The gateway emits an event
 
-After a request is served, or rejected with 429, the gateway hands one event
-to its Kafka producer:
+After a request is served, or rejected with 429, the gateway queues one event
+for Kafka:
 
 ```json
 { "timestamp": "2026-09-24T12:00:05.123456+00:00", "user_id": "…",
@@ -23,10 +23,18 @@ to its Kafka producer:
   lookup, limit check and handler, rounded.
 - 429s go to `rate-limited-events`, everything else to `api-requests`. Events
   are keyed by user, so one user's events stay ordered within a partition.
-- Sending is **fire-and-forget**: the event goes into the producer's buffer
-  and the request returns without waiting for a broker acknowledgement. A
-  Kafka outage loses events rather than failing requests, which is the right
-  trade for usage analytics (and would be the wrong one for billing).
+- Sending is **fire-and-forget**: the request puts the event on a bounded
+  in-memory queue (`USAGE_EVENT_BUFFER`, 10,000 per process) and returns. A
+  background task owns the producer and publishes from the queue, so nothing
+  a broker does can slow a request. With the broker down, `send()` blocks for
+  40 s once a partition's buffer fills, and only that task waits.
+- An outage costs events, not requests. The queue holds events until it is
+  full, then drops them, and `/health` counts what was `dropped` and what
+  Kafka refused (`failed`). That is the right trade for usage analytics (and
+  would be the wrong one for billing).
+- The same task connects to Kafka, retrying with backoff (1 s, doubling to
+  30 s), so a gateway that boots before Kafka starts publishing when Kafka
+  arrives, without a restart.
 - Requests rejected with 401 are not recorded; there is no user to attribute
   them to.
 

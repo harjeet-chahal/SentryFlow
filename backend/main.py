@@ -127,7 +127,7 @@ async def gateway_middleware(request: Request, call_next):
 
     if not result.allowed:
         # Record the rejection so throttling shows up in analytics.
-        await log_request(user_id, endpoint, 429, _elapsed_ms(started))
+        log_request(user_id, endpoint, 429, _elapsed_ms(started))
         return JSONResponse(
             status_code=429,
             content={"detail": "Rate limit exceeded."},
@@ -135,7 +135,7 @@ async def gateway_middleware(request: Request, call_next):
         )
 
     response = await call_next(request)
-    await log_request(user_id, endpoint, response.status_code, _elapsed_ms(started))
+    log_request(user_id, endpoint, response.status_code, _elapsed_ms(started))
 
     for header, value in result.headers.items():
         response.headers[header] = value

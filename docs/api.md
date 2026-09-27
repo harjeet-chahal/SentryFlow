@@ -150,7 +150,15 @@ Unauthenticated, because Kubernetes probes cannot present credentials.
 
 `/health/ready` returns `503` when a critical dependency is down. `/health`
 returns `degraded` (still `200`) when only Kafka is unavailable, because
-usage logging is fire-and-forget and the gateway still serves traffic.
+requests never wait on Kafka and the gateway still serves traffic. Its `kafka`
+component counts usage events waiting for Kafka (`queued`), lost before
+reaching it (`dropped`: queue full, or shut down first) and refused by it
+(`failed`):
+
+```json
+{ "status": "unavailable", "detail": "Kafka is not accepting events",
+  "queued": 5836, "dropped": 0, "failed": 78 }
+```
 
 See [deployment](deployment.md#probes) for why the three differ.
 

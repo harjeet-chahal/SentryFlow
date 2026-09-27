@@ -59,7 +59,7 @@ bounded by the aggregator's 2-second flush interval.
   share one Redis, so limits hold across them.
 - **This measures gateway overhead, not a backend.** `/api/v1/hello` does no
   work, so the time is the gateway itself: two Redis round trips (cached key
-  lookup, the Lua limiter script) and handing an event to the Kafka producer.
+  lookup, the Lua limiter script) and queueing an event for the Kafka publisher.
   A proxied upstream adds its own latency on top.
 - **It is a laptop, not AWS.** There is no network hop, TLS or load balancer
   between k6 and the gateway, and every dependency shares the same machine.

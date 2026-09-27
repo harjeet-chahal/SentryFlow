@@ -157,9 +157,9 @@ Beyond happy paths, the suites cover: sliding-window boundary behaviour,
 token-bucket refill and capping, fail-open and fail-closed on a Redis outage,
 refresh tokens rejected as access tokens, forged and expired tokens, per-user
 data scoping and admin-only writes, limit changes applying on the very next
-request, revocation evicting the cache, Kafka outages not reaching callers,
-at-least-once commit ordering in the aggregator, and password hashing staying
-off the event loop.
+request, revocation evicting the cache, a stalled Kafka broker not slowing
+callers, reconnecting to a Kafka that starts late, at-least-once commit
+ordering in the aggregator, and password hashing staying off the event loop.
 
 ---
 
@@ -206,11 +206,15 @@ a degraded dependency into an outage. `/health/ready` checks Postgres and
 Redis, so an affected pod leaves the Service and rejoins on recovery without a
 restart.
 
-**Kafka is non-critical.** Usage logging is fire-and-forget — the producer
-buffers and the request returns without waiting for a broker ack, because
-waiting would put Kafka round-trip latency on every client request. A broker
-outage loses analytics events rather than failing requests. That is the right
-trade for usage data and the wrong one for billing.
+**Kafka is non-critical and off the request path.** A request only puts its
+usage event on a bounded in-memory queue; a background task owns the producer
+and publishes from it. Awaiting the producer in the request would let a broker
+outage reach callers: with the broker down, aiokafka's `send()` blocks for 40 s
+once a partition's buffer fills. The queue rides out an outage, then drops
+events and counts them in `/health`. The task reconnects with backoff, so a pod
+that boots before Kafka starts publishing when Kafka arrives. A broker outage
+costs analytics events, never requests — the right trade for usage data and
+the wrong one for billing.
 
 **The limiter fails open.** If Redis is unreachable, requests are served
 without enforcement (`RATE_LIMIT_FAIL_OPEN`, default true). Losing the rate

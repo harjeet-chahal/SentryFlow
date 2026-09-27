@@ -3,10 +3,13 @@
 These drive real HTTP requests through authentication, rate limiting and
 usage logging in the order the middleware applies them.
 """
+import time
+
 import pytest
 
 from backend.config import settings
 from backend.main import is_api_key_exempt
+from backend.middlewares import logging_middleware
 from backend.models.database import SessionLocal
 from backend.models.models import RateLimit
 
@@ -158,10 +161,10 @@ def test_unauthenticated_requests_never_consume_a_budget(client, user, api_key):
 # Usage logging
 # --------------------------------------------------------------------------
 
-def test_served_requests_emit_a_usage_event(client, api_key, fake_kafka):
+def test_served_requests_emit_a_usage_event(client, api_key, published):
     client.get("/api/v1/hello", headers={"x-api-key": api_key["key"]})
 
-    events = fake_kafka.events_on(settings.API_REQUESTS_TOPIC)
+    events = published().events_on(settings.API_REQUESTS_TOPIC)
     assert len(events) == 1
     event = events[0]
     assert event["endpoint"] == "/api/v1/hello"
@@ -170,14 +173,14 @@ def test_served_requests_emit_a_usage_event(client, api_key, fake_kafka):
     assert event["timestamp"]
 
 
-def test_throttled_requests_are_logged_to_their_own_topic(client, user, api_key, fake_kafka):
+def test_throttled_requests_are_logged_to_their_own_topic(client, user, api_key, published):
     _set_limit(user["id"], rpm=1)
     headers = {"x-api-key": api_key["key"]}
 
     client.get("/api/v1/hello", headers=headers)
     client.get("/api/v1/hello", headers=headers)
 
-    throttled = fake_kafka.events_on(settings.RATE_LIMITED_TOPIC)
+    throttled = published().events_on(settings.RATE_LIMITED_TOPIC)
     assert len(throttled) == 1
     assert throttled[0]["status_code"] == 429
 
@@ -193,26 +196,26 @@ class SteppingClock:
         return self.now
 
 
-def test_response_time_covers_the_whole_gateway_path(client, api_key, fake_kafka, monkeypatch):
+def test_response_time_covers_the_whole_gateway_path(client, api_key, published, monkeypatch):
     import backend.main as gateway
 
     # Two readings: on arrival and once the handler has answered.
     monkeypatch.setattr(gateway, "time", SteppingClock(step=0.0034))
     client.get("/api/v1/hello", headers={"x-api-key": api_key["key"]})
 
-    assert fake_kafka.events_on(settings.API_REQUESTS_TOPIC)[0]["response_time"] == 3
+    assert published().events_on(settings.API_REQUESTS_TOPIC)[0]["response_time"] == 3
 
 
-def test_sub_millisecond_requests_round_rather_than_truncate(client, api_key, fake_kafka, monkeypatch):
+def test_sub_millisecond_requests_round_rather_than_truncate(client, api_key, published, monkeypatch):
     import backend.main as gateway
 
     monkeypatch.setattr(gateway, "time", SteppingClock(step=0.0006))
     client.get("/api/v1/hello", headers={"x-api-key": api_key["key"]})
 
-    assert fake_kafka.events_on(settings.API_REQUESTS_TOPIC)[0]["response_time"] == 1
+    assert published().events_on(settings.API_REQUESTS_TOPIC)[0]["response_time"] == 1
 
 
-def test_throttled_requests_record_their_real_time(client, user, api_key, fake_kafka, monkeypatch):
+def test_throttled_requests_record_their_real_time(client, user, api_key, published, monkeypatch):
     import backend.main as gateway
 
     _set_limit(user["id"], rpm=1)
@@ -222,12 +225,12 @@ def test_throttled_requests_record_their_real_time(client, user, api_key, fake_k
     monkeypatch.setattr(gateway, "time", SteppingClock(step=0.002))
     client.get("/api/v1/hello", headers=headers)
 
-    assert fake_kafka.events_on(settings.RATE_LIMITED_TOPIC)[0]["response_time"] == 2
+    assert published().events_on(settings.RATE_LIMITED_TOPIC)[0]["response_time"] == 2
 
 
-def test_events_are_partitioned_by_user(client, api_key, fake_kafka, user):
+def test_events_are_partitioned_by_user(client, api_key, published, user):
     client.get("/api/v1/hello", headers={"x-api-key": api_key["key"]})
-    assert fake_kafka.sent[0]["key"] == user["id"].encode("utf-8")
+    assert published().sent[0]["key"] == user["id"].encode("utf-8")
 
 
 def test_a_kafka_outage_does_not_break_requests(client, api_key, fake_kafka):
@@ -235,3 +238,18 @@ def test_a_kafka_outage_does_not_break_requests(client, api_key, fake_kafka):
     fake_kafka.fail = True
     response = client.get("/api/v1/hello", headers={"x-api-key": api_key["key"]})
     assert response.status_code == 200
+
+
+def test_a_stalled_broker_does_not_slow_requests(monkeypatch, client, api_key, fake_kafka):
+    """With the broker down, aiokafka's send() waits up to 40 s for buffer
+    space. Only the background publisher may wait; callers must not."""
+    monkeypatch.setattr(logging_middleware, "SHUTDOWN_TIMEOUT_SECONDS", 0.05)
+    fake_kafka.stall = 2.0
+    headers = {"x-api-key": api_key["key"]}
+
+    started = time.perf_counter()
+    statuses = [client.get("/api/v1/hello", headers=headers).status_code for _ in range(3)]
+    elapsed = time.perf_counter() - started
+
+    assert statuses == [200, 200, 200]
+    assert elapsed < 1.0, f"requests waited on Kafka: {elapsed:.2f}s"
