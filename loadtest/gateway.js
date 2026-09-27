@@ -1,16 +1,21 @@
 // SentryFlow gateway load test (k6).
 //
-// Three scenarios run together:
+// ALGORITHM picks the limiter under test: sliding_window (the default) or
+// token_bucket. Three scenarios run together, four for the token bucket:
 //
 //   steady     RATE requests/s for DURATION through the full gateway path:
-//              API-key lookup, the sliding-window Lua script in Redis, the
+//              API-key lookup, the limiter's Lua script in Redis, the
 //              handler, and the Kafka usage event. Its latency is the number
 //              the thresholds gate on.
-//   throttle   One caller limited to THROTTLE_LIMIT requests/minute, sending
-//              far more than that from several VUs at once. Exactly
-//              THROTTLE_LIMIT may succeed; every other request must be a 429
-//              with Retry-After. This is the limiter's correctness check
-//              under concurrency.
+//   throttle   One caller allowed THROTTLE_LIMIT requests, sending far more
+//              than that from several VUs at once. Exactly THROTTLE_LIMIT
+//              may succeed; every other request must be a 429 with
+//              Retry-After. This is the limiter's correctness check under
+//              concurrency.
+//   refill     Token bucket only. A caller whose bucket holds REFILL_BURST
+//              tokens and refills at 1/s fires a burst, waits REFILL_WAIT
+//              seconds and fires another. Exactly REFILL_BURST, then exactly
+//              the whole tokens that refilled, may succeed.
 //   freshness  Mid-run, sends a handful of requests as a fresh user and times
 //              how long until the analytics API reports them: the
 //              gateway -> Kafka -> aggregator -> ClickHouse lag.
@@ -19,8 +24,8 @@
 //
 //   docker compose --profile loadtest run --rm loadtest
 //
-// Setup signs up two users and raises/lowers their limits through the admin
-// API, so it needs the seeded admin's password in ADMIN_PASSWORD.
+// Setup signs up the callers and sets their limits through the admin API, so
+// it needs the seeded admin's password in ADMIN_PASSWORD.
 
 import http from 'k6/http';
 import { check, fail, sleep } from 'k6';
@@ -31,17 +36,49 @@ const RATE = Number(__ENV.RATE || 200);
 const DURATION = __ENV.DURATION || '60s';
 const ADMIN_USERNAME = __ENV.ADMIN_USERNAME || 'admin';
 const ADMIN_PASSWORD = __ENV.ADMIN_PASSWORD || '';
+const ALGORITHM = __ENV.ALGORITHM || 'sliding_window';
+if (!['sliding_window', 'token_bucket'].includes(ALGORITHM)) {
+  throw new Error(`ALGORITHM must be sliding_window or token_bucket, not ${ALGORITHM}`);
+}
+const TOKEN_BUCKET = ALGORITHM === 'token_bucket';
 const THROTTLE_LIMIT = Number(__ENV.THROTTLE_LIMIT || 30);
-// Kept inside one 60s window so the expected count is exact.
+// Kept inside one 60s window so the expected count is exact. The token bucket
+// refills at 1/minute, which adds under one token in this time.
 const THROTTLE_DURATION = '45s';
 const FRESHNESS_REQUESTS = 20;
+const REFILL_BURST = 10;
+// At 1 token/s the bucket holds 5.5 tokens by the second burst, so exactly 5
+// pass; the half token absorbs timing jitter either way.
+const REFILL_WAIT = 5.5;
 
 const throttleAllowed = new Counter('throttle_allowed');
 const throttleRejected = new Counter('throttle_rejected');
+const refillFirstAllowed = new Counter('refill_first_burst_allowed');
+const refillSecondAllowed = new Counter('refill_second_burst_allowed');
 const analyticsFreshness = new Trend('analytics_freshness_ms', true);
 
+const refillScenario = {
+  refill: {
+    executor: 'shared-iterations',
+    exec: 'refill',
+    vus: 1,
+    iterations: 1,
+    startTime: '5s',
+    maxDuration: '30s',
+  },
+};
+
+const refillThresholds = {
+  refill_first_burst_allowed: [`count==${REFILL_BURST}`],
+  refill_second_burst_allowed: [`count==${Math.floor(REFILL_WAIT)}`],
+};
+
 export const options = {
+  // Each burst in the refill scenario goes out at once rather than six at a time.
+  batch: REFILL_BURST * 2,
+  batchPerHost: REFILL_BURST * 2,
   scenarios: {
+    ...(TOKEN_BUCKET ? refillScenario : {}),
     steady: {
       executor: 'constant-arrival-rate',
       exec: 'steady',
@@ -79,6 +116,8 @@ export const options = {
     'checks{scenario:throttle}': ['rate==1'],
     // Events reach the dashboard in seconds, not at the next batch of 1000.
     analytics_freshness_ms: ['max<10000'],
+    // The bucket admits its capacity, then exactly what refilled.
+    ...(TOKEN_BUCKET ? refillThresholds : {}),
   },
   summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
 };
@@ -115,10 +154,17 @@ function newCaller(prefix) {
   return { id: signup.json('id'), token, key: key.json('key') };
 }
 
-function setLimit(adminToken, userId, requestsPerMinute) {
+// burstCapacity only matters to the token bucket.
+function setLimit(adminToken, userId, requestsPerMinute, burstCapacity = 10) {
   const res = http.put(
     `${BASE_URL}/limits`,
-    JSON.stringify({ user_id: userId, endpoint: '*', requests_per_minute: requestsPerMinute, algorithm: 'sliding_window' }),
+    JSON.stringify({
+      user_id: userId,
+      endpoint: '*',
+      requests_per_minute: requestsPerMinute,
+      burst_capacity: burstCapacity,
+      algorithm: ALGORITHM,
+    }),
     { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` } },
   );
   if (res.status !== 200) fail(`setting a limit failed: ${res.status} ${res.body}`);
@@ -131,13 +177,21 @@ export function setup() {
   const admin = login(ADMIN_USERNAME, ADMIN_PASSWORD);
 
   // High enough that the steady scenario measures served requests, not 429s.
+  // The bucket is as deep as the rate so concurrent requests never drain it.
   const steady = newCaller('load');
-  setLimit(admin, steady.id, 1000000);
+  setLimit(admin, steady.id, 1000000, 1000000);
 
   const throttled = newCaller('throttle');
-  setLimit(admin, throttled.id, THROTTLE_LIMIT);
+  if (TOKEN_BUCKET) setLimit(admin, throttled.id, 1, THROTTLE_LIMIT);
+  else setLimit(admin, throttled.id, THROTTLE_LIMIT);
 
-  return { steadyKey: steady.key, throttleKey: throttled.key };
+  const data = { steadyKey: steady.key, throttleKey: throttled.key };
+  if (TOKEN_BUCKET) {
+    const refilling = newCaller('refill');
+    setLimit(admin, refilling.id, 60, REFILL_BURST);
+    data.refillKey = refilling.key;
+  }
+  return data;
 }
 
 export function steady(data) {
@@ -160,6 +214,23 @@ export function throttle(data) {
     'allowed or throttled': (r) => r.status === 200 || r.status === 429,
     '429 says when to retry': (r) => r.status !== 429 || Number(r.headers['Retry-After']) > 0,
   });
+}
+
+// Send `size` requests at once; return how many were served.
+function burst(key, size) {
+  const params = {
+    headers: { 'x-api-key': key },
+    responseCallback: http.expectedStatuses(200, 429),
+  };
+  const url = `${BASE_URL}/api/v1/hello`;
+  const responses = http.batch(Array.from({ length: size }, () => ['GET', url, null, params]));
+  return responses.filter((r) => r.status === 200).length;
+}
+
+export function refill(data) {
+  refillFirstAllowed.add(burst(data.refillKey, REFILL_BURST * 2));
+  sleep(REFILL_WAIT);
+  refillSecondAllowed.add(burst(data.refillKey, REFILL_BURST * 2));
 }
 
 export function freshness() {
