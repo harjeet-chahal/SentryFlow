@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -39,7 +40,7 @@ def _to_out(rule: RateLimit, username: Optional[str]) -> RateLimitRuleOut:
 
 
 @router.get("", response_model=RateLimitRules)
-async def list_rules(
+def list_rules(
     user_id: Optional[str] = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -58,13 +59,7 @@ async def list_rules(
     )
 
 
-@router.put("", response_model=RateLimitRuleOut)
-async def upsert_rule(
-    body: RateLimitRuleIn,
-    _admin: User = Depends(get_current_admin),
-    db: Session = Depends(get_db),
-):
-    """Create the rule for (user, endpoint), or replace it if one exists."""
+def _save_rule(db: Session, body: RateLimitRuleIn) -> RateLimitRuleOut:
     user = db.query(User).filter(User.id == body.user_id).first()
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
@@ -93,9 +88,31 @@ async def upsert_rule(
             detail="The rule was changed at the same time; retry",
         )
     db.refresh(rule)
-
-    await invalidate_config_cache(body.user_id)
     return _to_out(rule, user.username)
+
+
+@router.put("", response_model=RateLimitRuleOut)
+async def upsert_rule(
+    body: RateLimitRuleIn,
+    _admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Create the rule for (user, endpoint), or replace it if one exists."""
+    saved = await run_in_threadpool(_save_rule, db, body)
+    await invalidate_config_cache(body.user_id)
+    return saved
+
+
+def _delete_rule(db: Session, rule_id: str) -> str:
+    """Delete a rule and return whose it was."""
+    rule = db.query(RateLimit).filter(RateLimit.id == rule_id).first()
+    if rule is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule not found")
+
+    user_id = rule.user_id
+    db.delete(rule)
+    db.commit()
+    return user_id
 
 
 @router.delete("/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -105,13 +122,6 @@ async def delete_rule(
     db: Session = Depends(get_db),
 ):
     """Remove a rule; the user falls back to their next match or the defaults."""
-    rule = db.query(RateLimit).filter(RateLimit.id == rule_id).first()
-    if rule is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule not found")
-
-    user_id = rule.user_id
-    db.delete(rule)
-    db.commit()
-
+    user_id = await run_in_threadpool(_delete_rule, db, rule_id)
     await invalidate_config_cache(user_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

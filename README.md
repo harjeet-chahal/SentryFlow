@@ -159,7 +159,8 @@ refresh tokens rejected as access tokens, forged and expired tokens, per-user
 data scoping and admin-only writes, limit changes applying on the very next
 request, revocation evicting the cache, a stalled Kafka broker not slowing
 callers, reconnecting to a Kafka that starts late, at-least-once commit
-ordering in the aggregator, and password hashing staying off the event loop.
+ordering in the aggregator, and password hashing and database queries staying
+off the event loop.
 
 ---
 
@@ -242,9 +243,12 @@ ClickHouse aggregates on read. Percentiles cannot be rebuilt from
 pre-aggregated percentiles, and there are no rollup tables to keep consistent.
 The dashboard's ClickHouse connection is read-only and time-bounded.
 
-**Nothing slow on the event loop.** bcrypt, database lookups and ClickHouse
-queries run in the threadpool. The load test caught bcrypt running inline:
-each login stalled every in-flight request for about 200 ms.
+**Nothing slow on the event loop.** bcrypt, database queries and ClickHouse
+queries run in the threadpool: routes with no async work are plain `def`,
+which FastAPI runs there, and async routes hand their queries over. The load
+test caught bcrypt running inline, where each login stalled every in-flight
+request for about 200 ms. `tests/test_event_loop.py` fails if any route runs
+SQL on the loop.
 
 ---
 

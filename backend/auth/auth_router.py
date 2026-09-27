@@ -36,9 +36,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# bcrypt is deliberately slow (~200 ms of CPU). Every call below goes through
-# the threadpool: on the event loop it would stall every in-flight gateway
-# request for the duration of each sign-up and login.
+# bcrypt is deliberately slow (~200 ms of CPU), and every query here is a
+# network round trip. Both run in the threadpool -- routes and dependencies
+# that do no async work are plain ``def``, which FastAPI runs there. On the
+# event loop they would stall every in-flight gateway request.
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
@@ -119,7 +120,7 @@ def decode_token(token: str, expected_type: str) -> str:
     return username
 
 
-async def get_current_user(
+def get_current_user(
     token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
 ) -> User:
     username = decode_token(token, ACCESS_TOKEN_TYPE)
@@ -163,7 +164,7 @@ def scoped_user_id(current_user: User, requested: Optional[str]) -> Optional[str
 
 
 @router.post("/signup", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def signup(user: UserCreate, db: Session = Depends(get_db)):
+def signup(user: UserCreate, db: Session = Depends(get_db)):
     existing = (
         db.query(User)
         .filter((User.username == user.username) | (User.email == user.email))
@@ -178,7 +179,7 @@ async def signup(user: UserCreate, db: Session = Depends(get_db)):
     db_user = User(
         email=user.email,
         username=user.username,
-        hashed_password=await run_in_threadpool(get_password_hash, user.password),
+        hashed_password=get_password_hash(user.password),
     )
     db.add(db_user)
     db.commit()
@@ -205,7 +206,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = 
 
 
 @router.post("/refresh", response_model=TokenResponse)
-async def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
+def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
     """Trade a valid refresh token for a fresh pair."""
     username = decode_token(payload.refresh_token, REFRESH_TOKEN_TYPE)
     user = get_user(db, username=username)
@@ -219,7 +220,7 @@ async def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/apikeys/create", response_model=ApiKeyResponse, status_code=status.HTTP_201_CREATED)
-async def create_api_key(
+def create_api_key(
     api_key_data: ApiKeyCreate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -236,10 +237,24 @@ async def create_api_key(
 
 
 @router.get("/apikeys", response_model=List[ApiKeyResponse])
-async def list_api_keys(
+def list_api_keys(
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     return db.query(ApiKey).filter(ApiKey.user_id == current_user.id).all()
+
+
+def _deactivate_api_key(db: Session, api_key_id: str, user_id: str) -> Optional[str]:
+    """Deactivate one of a user's keys. Returns the key, or None if not theirs."""
+    record = (
+        db.query(ApiKey)
+        .filter(ApiKey.id == api_key_id, ApiKey.user_id == user_id)
+        .first()
+    )
+    if record is None:
+        return None
+    record.is_active = False
+    db.commit()
+    return record.key
 
 
 @router.delete("/apikeys/{api_key_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -253,17 +268,11 @@ async def revoke_api_key(
     Deactivating the row alone is not enough: the gateway caches resolved
     keys for an hour, so a revoked key would keep working until that expired.
     """
-    record = (
-        db.query(ApiKey)
-        .filter(ApiKey.id == api_key_id, ApiKey.user_id == current_user.id)
-        .first()
-    )
-    if record is None:
+    key = await run_in_threadpool(_deactivate_api_key, db, api_key_id, current_user.id)
+    if key is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="API key not found")
 
-    record.is_active = False
-    db.commit()
-    await invalidate_api_key(record.key)
+    await invalidate_api_key(key)
     return None
 
 
