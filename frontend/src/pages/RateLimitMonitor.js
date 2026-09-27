@@ -168,22 +168,13 @@ const RateLimitMonitor = () => {
   const fetchLimits = useCallback((signal) => getJson(authAxios, '/limits', { signal }), [authAxios]);
   const limits = usePolling(fetchLimits);
 
-  // Admin-only: users for the rule form's picker.
-  const fetchUsers = useCallback(
-    (signal) => getJson(authAxios, '/analytics/users', { params: { range: '30d' }, signal }),
-    [authAxios]
-  );
-  const users = usePolling(isAdmin ? fetchUsers : null);
-
   const rules = useMemo(() => sortRules(limits.data?.rules), [limits.data]);
   const defaults = limits.data?.defaults;
-  const userList = users.data?.users;
   const rangeText = rangeDescription(range);
   const data = analytics.data;
   const totals = data?.totals ?? {};
 
-  const nameFor = (rule) =>
-    rule.username || userList?.find((u) => u.id === rule.user_id)?.username || rule.user_id;
+  const nameFor = (rule) => rule.username || rule.user_id;
 
   const handleEdit = (rule) => {
     setNotice(null);
@@ -354,9 +345,6 @@ const RateLimitMonitor = () => {
             key={`${editingRule?.id ?? 'new'}-${formVersion}`}
             rule={editingRule}
             defaults={defaults}
-            users={userList}
-            usersLoading={users.loading}
-            usersError={users.error}
             onSaved={handleSaved}
             onCancel={handleCancelEdit}
           />

@@ -58,6 +58,15 @@ let authAxios;
 const respond = (data) => Promise.resolve({ status: 200, data });
 const httpError = (status, detail) => Promise.reject({ response: { status, data: { detail } } });
 
+// GET /auth/users as the server answers it: searched, in username order, limited.
+const directory = (accounts) => ({ params }) => {
+  const term = (params.search ?? '').toLowerCase();
+  const matches = accounts.filter(
+    (u) => !term || u.username.toLowerCase().includes(term) || (u.email ?? '').toLowerCase().includes(term)
+  );
+  return respond({ total: matches.length, users: matches.slice(0, params.limit) });
+};
+
 const setAuth = ({ isAdmin }) => {
   useAuth.mockReturnValue({
     authAxios,
@@ -191,7 +200,6 @@ describe('RateLimitMonitor', () => {
     ],
   };
   const users = {
-    range: '30d',
     users: [
       { id: 'u1', username: 'alice', email: 'a@x.com', is_active: true, is_admin: false },
       { id: 'u2', username: 'bob', email: 'b@x.com', is_active: true, is_admin: false },
@@ -205,7 +213,7 @@ describe('RateLimitMonitor', () => {
     rules = [...limits.rules];
     routes['/analytics/rate-limits'] = () => respond(rateLimits);
     routes['/limits'] = () => respond({ ...limits, rules });
-    routes['/analytics/users'] = () => respond(users);
+    routes['/auth/users'] = directory(users.users);
     authAxios.put.mockImplementation((url, body) => {
       const user = users.users.find((u) => u.id === body.user_id);
       const saved = { id: `r${rules.length + 1}`, username: user.username, updated_at: '2026-09-24T12:05:00Z', ...body };
@@ -232,7 +240,7 @@ describe('RateLimitMonitor', () => {
     expect(screen.queryByText('Add or update a rule')).not.toBeInTheDocument();
     expect(await screen.findByLabelText('Allowed and rate-limited requests over time')).toBeInTheDocument();
     expect(screen.queryByText('Most throttled users')).not.toBeInTheDocument();
-    expect(authAxios.get).not.toHaveBeenCalledWith('/analytics/users', expect.anything());
+    expect(authAxios.get).not.toHaveBeenCalledWith('/auth/users', expect.anything());
   });
 
   test('admins can create a rule', async () => {
@@ -267,6 +275,9 @@ describe('RateLimitMonitor', () => {
     // The rules table is reloaded and shows the new rule.
     expect(await screen.findByText('5 req/min')).toBeInTheDocument();
     expect(screen.getByText('Saved the /api/v1/hello rule for bob. It takes effect immediately.')).toBeInTheDocument();
+    // A fresh, empty form is ready for the next rule.
+    expect(await screen.findByRole('option', { name: 'bob (b@x.com)' })).toBeInTheDocument();
+    expect(screen.getByLabelText('User')).toHaveValue('');
   });
 
   test('client-side validation stops obviously bad input', async () => {
@@ -284,6 +295,7 @@ describe('RateLimitMonitor', () => {
     authAxios.put.mockImplementation(() => httpError(404, 'User not found'));
     const confirm = jest.spyOn(window, 'confirm').mockReturnValue(true);
     render(<RateLimitMonitor />);
+    await screen.findByRole('option', { name: 'bob (b@x.com)' });
 
     userEvent.click(await screen.findByRole('button', { name: 'Edit' }));
     expect(screen.getByText('Edit the all-endpoints rule for alice')).toBeInTheDocument();
@@ -309,6 +321,8 @@ describe('RateLimitMonitor', () => {
     // The rules table is reloaded without the deleted rule.
     await waitFor(() => expect(screen.queryByText('120 req/min')).not.toBeInTheDocument());
     expect(screen.getByText('Deleted the all-endpoints rule for alice.')).toBeInTheDocument();
+    // Deleting the rule being edited returns the form to creating one.
+    expect(await screen.findByRole('option', { name: 'bob (b@x.com)' })).toBeInTheDocument();
     confirm.mockRestore();
   });
 });
@@ -352,8 +366,10 @@ describe('LogsExplorer', () => {
   test('admins see usernames and can filter by user; filtering is server-side', async () => {
     setAuth({ isAdmin: true });
     routes['/analytics/logs'] = serveLogs;
-    routes['/analytics/users'] = () =>
-      respond({ range: '30d', users: [{ id: 'u1', username: 'alice' }, { id: 'u2', username: 'bob' }] });
+    routes['/auth/users'] = directory([
+      { id: 'u1', username: 'alice' },
+      { id: 'u2', username: 'bob' },
+    ]);
     render(<LogsExplorer />);
 
     expect(await screen.findByText('Showing the latest 2 matching requests in the last hour')).toBeInTheDocument();
@@ -388,7 +404,7 @@ describe('LogsExplorer', () => {
     expect(logsCallParams()).toContainEqual({ range: '1h', status: 'all', limit: 200, endpoint: '/other' });
     // Only the final value was sent, not every keystroke.
     expect(logsCallParams().filter((p) => p.endpoint)).toHaveLength(1);
-    expect(authAxios.get).not.toHaveBeenCalledWith('/analytics/users', expect.anything());
+    expect(authAxios.get).not.toHaveBeenCalledWith('/auth/users', expect.anything());
   });
 
   test('the refresh button re-runs the query', async () => {
@@ -426,6 +442,9 @@ describe('UserView', () => {
     routes['/analytics/users'] = () =>
       respond({
         range: '24h',
+        total: 2,
+        limit: 50,
+        offset: 0,
         users: [
           {
             id: 'u1',
@@ -471,6 +490,71 @@ describe('UserView', () => {
       '/analytics/usage',
       expect.objectContaining({ params: { range: '24h', user_id: 'u2' } })
     );
+  });
+
+  test('admins page through users with traffic, busiest first', async () => {
+    setAuth({ isAdmin: true });
+    const ranked = Array.from({ length: 120 }, (_, i) => ({
+      id: `u${i}`,
+      username: `user${i}`,
+      email: null,
+      is_active: true,
+      is_admin: false,
+      requests: 1000 - i,
+      errors: 0,
+      rate_limited: 0,
+      p95_ms: 3,
+      last_seen: T0,
+    }));
+    // Traffic can outlive its account.
+    ranked[1] = { ...ranked[1], username: null, is_active: false };
+    routes['/analytics/users'] = ({ params }) =>
+      respond({
+        range: params.range,
+        total: ranked.length,
+        limit: params.limit,
+        offset: params.offset,
+        users: ranked.slice(params.offset, params.offset + params.limit),
+      });
+    routes['/analytics/usage'] = () => respond(usage());
+    const pages = () =>
+      authAxios.get.mock.calls.filter(([url]) => url === '/analytics/users').map(([, config]) => config.params);
+    renderUserView();
+
+    expect(await screen.findByText('1–50 of 120')).toBeInTheDocument();
+    expect(await screen.findByText('Total requests')).toBeInTheDocument();
+    expect(pages()).toEqual([{ range: '24h', limit: 50, offset: 0 }]);
+    expect(screen.getByRole('button', { name: 'Previous' })).toBeDisabled();
+    expect(screen.getByText('u1')).toBeInTheDocument();
+    expect(screen.getByText('Deleted')).toBeInTheDocument();
+
+    userEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(await screen.findByText('51–100 of 120')).toBeInTheDocument();
+    userEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(await screen.findByText('101–120 of 120')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Next' })).toBeDisabled();
+    expect(pages().map((p) => p.offset)).toEqual([0, 50, 100]);
+    // The busiest user stays selected while the table pages on.
+    expect(screen.getByRole('heading', { level: 2, name: /^user0\b/ })).toBeInTheDocument();
+
+    // A new range ranks users afresh, from the top.
+    userEvent.click(screen.getByRole('button', { name: '7d' }));
+    expect(await screen.findByText('1–50 of 120')).toBeInTheDocument();
+    expect(pages().at(-1)).toEqual({ range: '7d', limit: 50, offset: 0 });
+    // The selected user's charts follow the range too.
+    await waitFor(() =>
+      expect(screen.getByText('Total requests').closest('[aria-busy]')).toHaveAttribute('aria-busy', 'false')
+    );
+  });
+
+  test('a range without traffic says so', async () => {
+    setAuth({ isAdmin: true });
+    routes['/analytics/users'] = ({ params }) =>
+      respond({ range: params.range, total: 0, limit: params.limit, offset: params.offset, users: [] });
+    renderUserView();
+
+    expect(await screen.findByText('No traffic in the last 24 hours.')).toBeInTheDocument();
+    expect(authAxios.get).not.toHaveBeenCalledWith('/analytics/usage', expect.anything());
   });
 });
 

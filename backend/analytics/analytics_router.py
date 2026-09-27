@@ -3,10 +3,14 @@
 These endpoints authenticate a person (JWT), not a machine (API key), and
 scope what they return: an administrator sees every user's traffic, or one
 user's on request; anyone else sees only their own.
+
+They await ClickHouse, so they are async; their own database lookups go to
+the threadpool rather than stall the event loop.
 """
-from typing import Dict, Iterable, List, Literal, Optional
+from typing import Dict, Iterable, List, Literal, Optional, Set
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 from backend.analytics import queries
@@ -21,19 +25,24 @@ StatusClass = Literal["all", "2xx", "3xx", "4xx", "5xx"]
 _RANGE = Query("24h", alias="range", description="1h, 24h, 7d or 30d")
 
 
-def _usernames(db: Session, user_ids: Iterable[str]) -> Dict[str, str]:
-    ids = {uid for uid in user_ids if uid}
-    if not ids:
-        return {}
+def _query_usernames(db: Session, ids: Set[str]) -> Dict[str, str]:
     return dict(db.query(User.id, User.username).filter(User.id.in_(ids)).all())
 
 
-def _scope(db: Session, user_id: Optional[str]) -> dict:
-    return {"user_id": user_id, "username": _usernames(db, [user_id]).get(user_id) if user_id else None}
+async def _usernames(db: Session, user_ids: Iterable[Optional[str]]) -> Dict[str, str]:
+    ids = {uid for uid in user_ids if uid}
+    if not ids:
+        return {}
+    return await run_in_threadpool(_query_usernames, db, ids)
 
 
-def _with_usernames(db: Session, rows: List[dict]) -> List[dict]:
-    names = _usernames(db, (row["user_id"] for row in rows))
+async def _scope(db: Session, user_id: Optional[str]) -> dict:
+    names = await _usernames(db, [user_id])
+    return {"user_id": user_id, "username": names.get(user_id)}
+
+
+async def _with_usernames(db: Session, rows: List[dict]) -> List[dict]:
+    names = await _usernames(db, (row["user_id"] for row in rows))
     return [{**row, "username": names.get(row["user_id"])} for row in rows]
 
 
@@ -48,7 +57,7 @@ async def usage(
     scope = scoped_user_id(current_user, user_id)
     window = queries.window_for(range_)
     data = await queries.usage(window, scope)
-    return {"range": range_, "step_seconds": window.step, "scope": _scope(db, scope), **data}
+    return {"range": range_, "step_seconds": window.step, "scope": await _scope(db, scope), **data}
 
 
 @router.get("/rate-limits")
@@ -63,8 +72,8 @@ async def rate_limits(
     window = queries.window_for(range_)
     # Ranking users only makes sense when looking across all of them.
     data = await queries.rate_limits(window, scope, include_users=scope is None)
-    data["by_user"] = _with_usernames(db, data["by_user"])
-    return {"range": range_, "step_seconds": window.step, "scope": _scope(db, scope), **data}
+    data["by_user"] = await _with_usernames(db, data["by_user"])
+    return {"range": range_, "step_seconds": window.step, "scope": await _scope(db, scope), **data}
 
 
 @router.get("/logs")
@@ -86,31 +95,47 @@ async def request_logs(
         "range": range_,
         "limit": limit,
         "truncated": data["truncated"],
-        "rows": _with_usernames(db, data["rows"]),
+        "rows": await _with_usernames(db, data["rows"]),
     }
+
+
+def _accounts(db: Session, ids: List[str]) -> Dict[str, dict]:
+    users = db.query(User).filter(User.id.in_(ids)).all() if ids else []
+    return {
+        user.id: {
+            "username": user.username,
+            "email": user.email,
+            "is_active": bool(user.is_active),
+            "is_admin": bool(user.is_admin),
+        }
+        for user in users
+    }
+
+
+# Traffic outlives the account it came from.
+_DELETED = {"username": None, "email": None, "is_active": False, "is_admin": False}
 
 
 @router.get("/users")
 async def users(
     range_: TimeRange = _RANGE,
+    limit: int = Query(50, ge=1, le=queries.MAX_USERS_PAGE),
+    offset: int = Query(0, ge=0),
     _admin: User = Depends(get_current_admin),
     db: Session = Depends(get_db),
 ):
-    """Every account with its traffic in the range. Administrators only."""
-    window = queries.window_for(range_)
-    stats = await queries.per_user(window)
-    idle = {"requests": 0, "errors": 0, "rate_limited": 0, "p95_ms": None, "last_seen": None}
+    """Users with traffic in the range, busiest first, a page at a time.
 
-    accounts = [
-        {
-            "id": user.id,
-            "username": user.username,
-            "email": user.email,
-            "is_active": bool(user.is_active),
-            "is_admin": bool(user.is_admin),
-            **stats.get(user.id, idle),
-        }
-        for user in db.query(User).all()
-    ]
-    accounts.sort(key=lambda account: (-account["requests"], account["username"] or ""))
-    return {"range": range_, "users": accounts}
+    Administrators only. ``total`` counts every user with traffic. Accounts
+    without any are not listed; ``/auth/users`` lists every account.
+    """
+    window = queries.window_for(range_)
+    page = await queries.top_users(window, limit, offset)
+    accounts = await run_in_threadpool(_accounts, db, [row["user_id"] for row in page["users"]])
+
+    listed = []
+    for row in page["users"]:
+        stats = dict(row)
+        user_id = stats.pop("user_id")
+        listed.append({"id": user_id, **accounts.get(user_id, _DELETED), **stats})
+    return {"range": range_, "total": page["total"], "limit": limit, "offset": offset, "users": listed}

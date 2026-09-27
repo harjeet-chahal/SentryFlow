@@ -136,10 +136,10 @@ cd frontend && npm test       # dashboard helpers and pages
 
 | Suite | Tests | Coverage |
 | --- | ---: | ---: |
-| Backend | 252 | **94%** statement and branch (CI floor 90%) |
+| Backend | 292 | **95%** statement and branch (CI floor 90%) |
 | Aggregator | 32 | 99% (CI floor 90%) |
 | Analytics SQL, against real ClickHouse | 11 | — |
-| Frontend | 97 | — |
+| Frontend | 103 | — |
 
 The unit suites need no running services. Postgres is replaced by SQLite;
 Redis by `fakeredis`, which runs the real Lua scripts, so the limiter
@@ -156,10 +156,11 @@ read as uncovered even though `tests/test_gateway.py` drives them over HTTP.
 Beyond happy paths, the suites cover: sliding-window boundary behaviour,
 token-bucket refill and capping, fail-open and fail-closed on a Redis outage,
 refresh tokens rejected as access tokens, forged and expired tokens, per-user
-data scoping and admin-only writes, limit changes applying on the very next
-request, revocation evicting the cache, Kafka outages not reaching callers,
-at-least-once commit ordering in the aggregator, and password hashing staying
-off the event loop.
+data scoping and admin-only writes, paging users without loading every
+account, limit changes applying on the very next request, revocation evicting
+the cache, a stalled Kafka broker not slowing callers, reconnecting to a Kafka
+that starts late, at-least-once commit ordering in the aggregator, and
+password hashing and database queries staying off the event loop.
 
 ---
 
@@ -206,11 +207,15 @@ a degraded dependency into an outage. `/health/ready` checks Postgres and
 Redis, so an affected pod leaves the Service and rejoins on recovery without a
 restart.
 
-**Kafka is non-critical.** Usage logging is fire-and-forget — the producer
-buffers and the request returns without waiting for a broker ack, because
-waiting would put Kafka round-trip latency on every client request. A broker
-outage loses analytics events rather than failing requests. That is the right
-trade for usage data and the wrong one for billing.
+**Kafka is non-critical and off the request path.** A request only puts its
+usage event on a bounded in-memory queue; a background task owns the producer
+and publishes from it. Awaiting the producer in the request would let a broker
+outage reach callers: with the broker down, aiokafka's `send()` blocks for 40 s
+once a partition's buffer fills. The queue rides out an outage, then drops
+events and counts them in `/health`. The task reconnects with backoff, so a pod
+that boots before Kafka starts publishing when Kafka arrives. A broker outage
+costs analytics events, never requests — the right trade for usage data and
+the wrong one for billing.
 
 **The limiter fails open.** If Redis is unreachable, requests are served
 without enforcement (`RATE_LIMIT_FAIL_OPEN`, default true). Losing the rate
@@ -238,9 +243,12 @@ ClickHouse aggregates on read. Percentiles cannot be rebuilt from
 pre-aggregated percentiles, and there are no rollup tables to keep consistent.
 The dashboard's ClickHouse connection is read-only and time-bounded.
 
-**Nothing slow on the event loop.** bcrypt, database lookups and ClickHouse
-queries run in the threadpool. The load test caught bcrypt running inline:
-each login stalled every in-flight request for about 200 ms.
+**Nothing slow on the event loop.** bcrypt, database queries and ClickHouse
+queries run in the threadpool: routes with no async work are plain `def`,
+which FastAPI runs there, and async routes hand their queries over. The load
+test caught bcrypt running inline, where each login stalled every in-flight
+request for about 200 ms. `tests/test_event_loop.py` fails if any route runs
+SQL on the loop.
 
 ---
 

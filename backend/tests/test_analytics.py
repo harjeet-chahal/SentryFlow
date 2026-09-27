@@ -333,15 +333,19 @@ def test_user_breakdown_is_for_admins_only(client, user):
     assert client.get("/analytics/users", headers=user["headers"]).status_code == 403
 
 
-def test_user_breakdown_lists_every_account(client, admin, user_factory, fake_clickhouse):
+def test_user_breakdown_is_a_page_of_the_busiest_users(client, admin, user_factory, fake_clickhouse):
     busy = user_factory(username="busy")
-    idle = user_factory(username="idle")
-    fake_clickhouse.results["per_user"] = [(busy["id"], 90, 3, 9, 12.5, NOW)]
+    quiet = user_factory(username="quiet")
+    fake_clickhouse.results["top_users"] = [
+        (busy["id"], 90, 3, 9, 12.5, NOW),
+        (quiet["id"], 4, 0, 0, 2.0, NOW - 60),
+    ]
+    fake_clickhouse.results["active_users"] = [(7,)]
 
-    users = client.get("/analytics/users?range=7d", headers=admin["headers"]).json()["users"]
+    body = client.get("/analytics/users?range=7d&limit=2&offset=4", headers=admin["headers"]).json()
 
-    assert [u["username"] for u in users] == ["busy", "idle", "operator"]
-    assert users[0] == {
+    assert (body["range"], body["total"], body["limit"], body["offset"]) == ("7d", 7, 2, 4)
+    assert body["users"][0] == {
         "id": busy["id"],
         "username": "busy",
         "email": busy["email"],
@@ -353,14 +357,74 @@ def test_user_breakdown_lists_every_account(client, admin, user_factory, fake_cl
         "p95_ms": 12.5,
         "last_seen": NOW,
     }
-    assert users[1]["requests"] == 0 and users[1]["last_seen"] is None
-    assert users[2]["is_admin"] is True
-    assert "user_id =" not in fake_clickhouse.call("per_user")["sql"]
-    assert idle["id"] == users[1]["id"]
+    assert [u["username"] for u in body["users"]] == ["busy", "quiet"]
+    # Ranking and paging happen in ClickHouse, across every user.
+    page = fake_clickhouse.call("top_users")
+    assert (page["params"]["limit"], page["params"]["offset"]) == (2, 4)
+    assert "ORDER BY requests DESC, user_id" in page["sql"]
+    assert "user_id =" not in page["sql"]
+
+
+def test_user_breakdown_reads_only_the_page_from_the_database(client, admin, user_factory, fake_clickhouse):
+    """The page's accounts are looked up by id, not by loading every user."""
+    from sqlalchemy import event
+
+    from backend.models import database
+
+    ids = [user_factory(username=f"user{n}")["id"] for n in range(5)]
+    fake_clickhouse.results["top_users"] = [(uid, 1, 0, 0, 1.0, NOW) for uid in ids[:2]]
+    user_queries = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        if "FROM users" in statement:
+            user_queries.append(parameters)
+
+    event.listen(database.engine, "before_cursor_execute", record)
+    try:
+        client.get("/analytics/users", headers=admin["headers"])
+    finally:
+        event.remove(database.engine, "before_cursor_execute", record)
+
+    # One lookup for the admin's token, one for the page's two accounts.
+    assert sorted(ids[:2]) == sorted(user_queries[-1])
+
+
+def test_user_breakdown_defaults_to_the_first_fifty(client, admin, fake_clickhouse):
+    body = client.get("/analytics/users", headers=admin["headers"]).json()
+
+    assert (body["total"], body["limit"], body["offset"], body["users"]) == (0, 50, 0, [])
+    assert fake_clickhouse.call("top_users")["params"]["limit"] == 50
+
+
+@pytest.mark.parametrize("query", ["limit=0", "limit=201", "offset=-1"])
+def test_user_breakdown_rejects_bad_pages(client, admin, query):
+    assert client.get(f"/analytics/users?{query}", headers=admin["headers"]).status_code == 422
+
+
+def test_traffic_from_a_deleted_account_is_still_listed(client, admin, fake_clickhouse):
+    fake_clickhouse.results["top_users"] = [("gone", 5, 0, 0, 1.0, NOW)]
+    fake_clickhouse.results["active_users"] = [(1,)]
+
+    users = client.get("/analytics/users", headers=admin["headers"]).json()["users"]
+
+    assert users == [
+        {
+            "id": "gone",
+            "username": None,
+            "email": None,
+            "is_active": False,
+            "is_admin": False,
+            "requests": 5,
+            "errors": 0,
+            "rate_limited": 0,
+            "p95_ms": 1.0,
+            "last_seen": NOW,
+        }
+    ]
 
 
 def test_nan_latency_never_reaches_json(client, admin, fake_clickhouse):
-    fake_clickhouse.results["per_user"] = [(admin["id"], 4, 0, 4, float("nan"), NOW)]
+    fake_clickhouse.results["top_users"] = [(admin["id"], 4, 0, 4, float("nan"), NOW)]
     users = client.get("/analytics/users", headers=admin["headers"]).json()["users"]
     assert users[0]["p95_ms"] is None
     assert not any(isinstance(v, float) and math.isnan(v) for v in users[0].values())

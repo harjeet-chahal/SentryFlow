@@ -171,14 +171,24 @@ async def test_logs_filter_sort_and_truncate(warehouse, window):
     assert by_path["truncated"] is False
 
 
-async def test_per_user_breakdown(warehouse, window):
-    warehouse(*traffic(window))
+async def test_top_users_ranks_and_pages(warehouse, window):
+    warehouse(
+        *traffic(window),
+        # carol ties bob on requests; the tie breaks on user id
+        (at(window, -2, 1), "carol", "/api/v1/hello", 200, 7),
+        (at(window, -2, 2), "carol", "/api/v1/hello", 200, 9),
+    )
 
-    stats = await queries.per_user(window)
+    first = await queries.top_users(window, limit=2, offset=0)
+    last = await queries.top_users(window, limit=2, offset=2)
 
-    assert set(stats) == {"alice", "bob"}
-    assert (stats["alice"]["requests"], stats["alice"]["rate_limited"]) == (6, 2)
-    assert stats["bob"]["last_seen"] == at(window, -3, 2)
+    assert first["total"] == last["total"] == 3
+    assert [u["user_id"] for u in first["users"]] == ["alice", "bob"]
+    assert [u["user_id"] for u in last["users"]] == ["carol"]
+    alice, bob = first["users"]
+    assert (alice["requests"], alice["errors"], alice["rate_limited"]) == (6, 1, 2)
+    assert bob["last_seen"] == at(window, -3, 2)
+    assert (await queries.top_users(window, limit=2, offset=3))["users"] == []
 
 
 async def test_an_empty_window_yields_zeros_not_errors(warehouse, window):
@@ -187,6 +197,7 @@ async def test_an_empty_window_yields_zeros_not_errors(warehouse, window):
     assert usage["summary"]["requests"] == 0
     assert usage["summary"]["p95_ms"] is None
     assert usage["top_endpoints"] == []
+    assert await queries.top_users(window, limit=10, offset=0) == {"total": 0, "users": []}
 
 
 async def test_the_dashboard_connection_is_read_only(warehouse, database):

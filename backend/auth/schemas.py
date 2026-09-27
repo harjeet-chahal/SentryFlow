@@ -25,6 +25,11 @@ class UserResponse(UserBase):
         orm_mode = True
 
 
+class UserDirectory(BaseModel):
+    total: int
+    users: List[UserResponse]
+
+
 class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str

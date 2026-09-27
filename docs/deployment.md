@@ -32,8 +32,9 @@ SENTRYFLOW_ADMIN_PASSWORD=choose-one docker compose up -d --build
 
 Start-up is ordered by health checks. A one-shot `migrate` service runs
 `python -m backend.setup_db` once Postgres is ready; the gateway starts after it
-succeeds and Kafka is healthy (the gateway opens its Kafka producer once, at
-boot). `setup_db` is idempotent: it creates missing tables, applies additive
+succeeds and Kafka is healthy. (The gateway would also start without Kafka and
+connect once it arrives; waiting keeps the start-up log free of retries.)
+`setup_db` is idempotent: it creates missing tables, applies additive
 upgrades, creates the `admin` account if absent, and seeds a catch-all rate
 limit. Without `SENTRYFLOW_ADMIN_PASSWORD` it generates a password and prints
 it once: `docker compose logs migrate`.
@@ -109,9 +110,10 @@ degraded dependency into a full outage. Readiness checks only what is needed
 to answer a request, so an affected pod leaves the Service endpoints and
 rejoins on recovery without a restart.
 
-Kafka is excluded from readiness because usage logging is fire-and-forget —
-the gateway still authenticates, rate limits and serves traffic without it.
-`/health` reports that state as `degraded`.
+Kafka is excluded from readiness because requests never wait on it: they
+queue usage events for a background publisher, which reconnects on its own,
+so restarting the pod would fix nothing. `/health` reports Kafka trouble as
+`degraded`, with counts of queued, dropped and failed events.
 
 ### Validating changes
 

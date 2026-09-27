@@ -29,6 +29,9 @@ class Settings:
     # Kafka topics
     API_REQUESTS_TOPIC: str = os.getenv("API_REQUESTS_TOPIC", "api-requests")
     RATE_LIMITED_TOPIC: str = os.getenv("RATE_LIMITED_TOPIC", "rate-limited-events")
+    # Usage events waiting for Kafka, per process. Beyond this they are dropped
+    # rather than held: a few seconds of traffic at load-test rates.
+    USAGE_EVENT_BUFFER: int = int(os.getenv("USAGE_EVENT_BUFFER", "10000"))
 
     # ClickHouse, which the dashboard's analytics endpoints read
     CLICKHOUSE_HOST: str = os.getenv("CLICKHOUSE_HOST", "localhost")

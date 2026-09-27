@@ -15,6 +15,7 @@ services:
 These are set before any ``backend`` import, because configuration is read
 from the environment at module import time.
 """
+import asyncio
 import os
 import tempfile
 
@@ -42,15 +43,24 @@ class RecordingProducer:
     def __init__(self, fail: bool = False):
         self.sent = []
         self.fail = fail
+        # Seconds send() waits first, as aiokafka's does for buffer space
+        # when the broker is down.
+        self.stall = 0.0
+        self.stopped = False
 
     async def send(self, topic, value, key=None):
+        if self.stall:
+            await asyncio.sleep(self.stall)
         if self.fail:
             raise OSError("broker unreachable")
         self.sent.append({"topic": topic, "value": value, "key": key})
-        return None
+        # Like aiokafka, send() only buffers; this future settles on delivery.
+        delivery = asyncio.get_running_loop().create_future()
+        delivery.set_result(None)
+        return delivery
 
     async def stop(self):
-        return None
+        self.stopped = True
 
     def events_on(self, topic):
         return [m["value"] for m in self.sent if m["topic"] == topic]
@@ -104,9 +114,10 @@ def fake_redis():
 def fake_kafka():
     """Capture produced events instead of reaching a broker."""
     producer = RecordingProducer()
+    logging_middleware.reset()
     logging_middleware.set_producer(producer)
     yield producer
-    logging_middleware.set_producer(None)
+    logging_middleware.reset()
 
 
 @pytest.fixture(autouse=True)
@@ -136,6 +147,21 @@ def client(app):
     """
     with TestClient(app) as test_client:
         yield test_client
+
+
+@pytest.fixture
+def published(client, fake_kafka):
+    """What reached Kafka, once the background publisher has caught up.
+
+    Requests only queue their events, so read them through this rather than
+    from ``fake_kafka`` straight after a request.
+    """
+
+    def _published():
+        client.portal.call(logging_middleware.flush)
+        return fake_kafka
+
+    return _published
 
 
 @pytest.fixture

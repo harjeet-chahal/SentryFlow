@@ -59,7 +59,7 @@ bounded by the aggregator's 2-second flush interval.
   share one Redis, so limits hold across them.
 - **This measures gateway overhead, not a backend.** `/api/v1/hello` does no
   work, so the time is the gateway itself: two Redis round trips (cached key
-  lookup, the Lua limiter script) and handing an event to the Kafka producer.
+  lookup, the Lua limiter script) and queueing an event for the Kafka publisher.
   A proxied upstream adds its own latency on top.
 - **It is a laptop, not AWS.** There is no network hop, TLS or load balancer
   between k6 and the gateway, and every dependency shares the same machine.
@@ -76,3 +76,26 @@ login stalled every gateway request in flight on that worker. Hashing and
 verification now run in the threadpool. After the fix, the steady scenario's
 worst request at 200/s was 8.7 ms. `test_login_checks_the_password_off_the_event_loop`
 fails if either call moves back onto the loop.
+
+### The cost of queueing usage events
+
+The table above predates usage events moving onto an in-memory queue, which
+a background task publishes to Kafka (see [analytics](analytics.md)). The
+queue adds one task switch per event. To price that, the steady scenario ran
+on its own against the code before and after the change, alternating, on the
+same laptop: the gateway under uvicorn on the host, with Redis and Kafka in
+Docker, and k6 in Docker reaching the host through Docker Desktop. That path
+differs from the compose network, so compare these rows with each other, not
+with the table.
+
+| Offered rate | Code | Median | p95 | p99 |
+| ---: | --- | ---: | ---: | ---: |
+| 1,000/s, 30 s | before | 1.38 ms | 2.03 ms | 3.3 ms |
+| 1,000/s, 30 s | after | 1.38 ms | 2.00 ms | 3.8 ms |
+| 1,500/s, 30 s, 3 runs | before | 1.92–1.94 ms | 3.1–3.8 ms | 6.9–9.9 ms |
+| 1,500/s, 30 s, 3 runs | after | 1.96–2.00 ms | 3.4–3.8 ms | 8.3–16.1 ms |
+
+There is no measurable cost at 1,000/s. At 1,500/s, where one worker is close
+to saturation, the median rises by about 0.05 ms and p99 trends higher within
+run-to-run noise. In exchange, a broker outage no longer holds each request
+for up to 40 seconds.
