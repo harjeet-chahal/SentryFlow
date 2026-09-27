@@ -76,15 +76,15 @@ memory stays constant however much traffic a caller sends.
 
 ### Choosing one
 
-Measured with k6 against the compose stack
-([load-testing.md](load-testing.md#sliding-window-vs-token-bucket)):
+Measured with k6 against the compose stack, two runs of each algorithm at
+1,000 req/s ([load-testing.md](load-testing.md#results)):
 
 | | Sliding window | Token bucket |
 | --- | --- | --- |
 | Admits | at most *N* requests in any trailing 60 s | a burst up to the capacity, then *N* per minute |
 | Work per request | `O(log N)` | `O(1)` |
-| Median latency at 1,000 req/s | 0.66–0.90 ms | 0.64–0.94 ms |
-| Busy caller's key after 30 s | 4.2 MB at 1,000 req/s, 7.7 MB at 2,000 req/s | 186–187 bytes at any rate |
+| Median latency at 1,000 req/s | 0.68–0.93 ms | 0.64–0.80 ms |
+| Busy caller's key after 30 s | 4.0 MB at 1,000 req/s, 6.2 MB at 1,500 req/s | 170–186 bytes at any rate |
 | Caller allowed 30, sending over 200 | exactly 30 admitted in every run | exactly 30 admitted in every run |
 
 The two cost the same per request; memory is the real difference. A sliding
@@ -252,7 +252,7 @@ on every request: slower, but still correct.
     "no rule" result;
   - evicting a user's cached rules;
   - failing open, and failing closed.
-- [`backend/tests/test_limits.py`](../backend/tests/test_limits.py) (19
+- [`backend/tests/test_limits.py`](../backend/tests/test_limits.py) (24
   tests) covers the rules API:
   - who may read and who may write;
   - validation, and two admins creating the same rule at once;

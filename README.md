@@ -29,11 +29,11 @@ seconds.</sub>
 
 | Result | Details |
 | --- | --- |
-| **1,500 req/s per worker** | one gateway process, p99 24.9 ms, zero failed requests ([k6](docs/load-testing.md)) |
-| **0.7 ms median overhead** | at 1,000 req/s: authentication, rate-limit check and usage event (p95 1.4 ms). Measured with API keys; [JWTs add about 0.06 ms](docs/load-testing.md#api-keys-vs-jwts) |
+| **1,500 req/s per worker** | one gateway process, p99 10.5 ms, zero failed requests ([k6](docs/load-testing.md)) |
+| **0.7–0.9 ms median overhead** | at 1,000 req/s, over two runs: JWT check, rate-limit check and usage event (p95 1.3–1.9 ms) |
 | **Exactly 30 through** | a caller allowed 30 requests sent over 200; exactly 30 succeeded in every load-test run, with either algorithm |
-| **≤ 2.1 s to analytics** | from a request to its row in the analytics API |
-| **186 bytes vs 4.2 MB** | Redis state for one high-limit caller after 30 s at 1,000 req/s: token bucket vs sliding window |
+| **≤ 2.2 s to analytics** | from a request to its row in the analytics API |
+| **170 bytes vs 4.0 MB** | Redis state for one high-limit caller after 30 s at 1,000 req/s: token bucket vs sliding window |
 | **471 tests** | backend coverage 96.0%, aggregator 99.3%, frontend 80.2%; the analytics SQL runs against a real ClickHouse |
 | **6 CI jobs per PR** | tests with coverage floors, SQL against ClickHouse, frontend tests and build, Helm lint and `kubeconform -strict`, image builds |
 
@@ -121,9 +121,8 @@ Postgres there, once per token rather than on every call.
    response returns. The request never waits on Kafka.
 
 The gateway's whole overhead is a signature check, three Redis round trips
-(revocation, rule, Lua script) and a queue put. With the API-key lookup that
-came before JWTs, that measured a 0.7 ms median at 1,000 requests/s; the JWT
-check adds about 0.06 ms.
+(revocation, rule, Lua script) and a queue put: a 0.7–0.9 ms median at
+1,000 requests/s.
 
 ### Analytics path
 
@@ -171,8 +170,8 @@ shares the same Redis, a limit applies across the whole fleet, not per pod.
 | --- | --- | --- |
 | Admits | at most *N* requests in any trailing 60 s | a burst up to the bucket's capacity, then *N* per minute |
 | Redis state per caller and endpoint | one sorted-set entry per admitted request in the window | two fields |
-| Measured key size, high-limit caller, 30 s at 1,000 req/s | 4.2 MB | 186 bytes |
-| Measured median latency, 1,000 req/s | 0.66–0.90 ms | 0.64–0.94 ms |
+| Measured key size, high-limit caller, 30 s at 1,000 req/s | 4.0 MB | 170 bytes |
+| Measured median latency, 1,000 req/s, two runs each | 0.68–0.93 ms | 0.64–0.80 ms |
 | Choose it for | exact enforcement at the boundary | bursts, and high limits at low memory |
 
 A fixed window lets a caller send twice the limit around a window boundary;
@@ -193,18 +192,18 @@ from their next request. The full design is in
 
 ## Performance
 
-k6 against the Docker Compose stack on one laptop (Apple M4 Pro). One gateway
-process, a single uvicorn worker, ran alongside Redis, Kafka, ClickHouse and
-Postgres. The test endpoint does no work, so these numbers measure the
-gateway's own overhead. The method and every run are in
-[docs/load-testing.md](docs/load-testing.md).
+k6 against the Docker Compose stack on one laptop (Apple M4 Pro), measured on
+2026-09-27 with JWT authentication. One gateway process, a single uvicorn
+worker, ran alongside Redis, Kafka, ClickHouse and Postgres. The test endpoint
+does no work, so these numbers measure the gateway's own overhead. The method
+and every run are in [docs/load-testing.md](docs/load-testing.md).
 
 | Offered load | Requests | Median | p95 | p99 | Failed |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 200/s for 60 s | 12,001 | 1.5 ms | 2.3 ms | 2.9 ms | 0 |
-| 1,000/s for 30 s | 30,001 | 0.7 ms | 1.4 ms | 2.7 ms | 0 |
-| 1,500/s for 30 s | 45,001 | 0.8 ms | 3.0 ms | 24.9 ms | 0 |
-| 2,000/s for 30 s | 22,064 served; 37,941 never sent | 1.7 s | 13.4 s | 13.8 s | 0 |
+| 200/s for 60 s | 12,001 | 1.5 ms | 2.6 ms | 4.2 ms | 0 |
+| 1,000/s for 30 s, two runs | 30,000; 30,003 | 0.7, 0.9 ms | 1.3, 1.9 ms | 2.8, 4.4 ms | 0 |
+| 1,500/s for 30 s | 45,001 | 0.8 ms | 2.8 ms | 10.5 ms | 0 |
+| 2,000/s for 30 s | 46,757 served; 13,255 never sent | 0.32 s | 4.0 s | 4.7 s | 0 |
 
 - **One worker saturates between 1,500 and 2,000 requests/s.** Past that
   point requests queue and latency jumps to seconds, so the answer is more
@@ -219,15 +218,15 @@ gateway's own overhead. The method and every run are in
 - **The load test found a real bug.** bcrypt was hashing passwords on the
   event loop, and each login stalled every in-flight request for about
   200 ms: p99 was 88 ms at just 20 requests/s. Hashing now runs in the
-  threadpool. The slowest request at 200 requests/s is now 8.7 ms.
+  threadpool, and p99 at 200 requests/s is 4.2 ms.
 - **Keeping Kafka off the request path costs almost nothing.** Queueing usage
   events added no measurable latency at 1,000 requests/s and about 0.05 ms to
   the median at 1,500. Before the queue, a Kafka outage held each request for
   up to 40 seconds.
-- **JWTs cost about 0.06 ms.** The runs above predate them, when the gateway
-  looked each API key up in Redis. Run before and after, alternately, at
-  1,000 requests/s, the JWT build's median was 0.06–0.07 ms higher, and p95
-  and p99 stayed within run-to-run noise. Throttling stayed exact.
+- **JWTs cost about 0.06 ms.** Before them, the gateway looked each API key
+  up in Redis. Run before and after the change, alternately, at 1,000
+  requests/s, the JWT build's median was 0.06–0.07 ms higher, and p95 and p99
+  stayed within run-to-run noise.
 
 ---
 
@@ -312,7 +311,7 @@ make test-integration         # analytics SQL; needs a ClickHouse, e.g. the comp
 | Backend | 325 | **96.0%** of statements and branches (CI fails below 90%) |
 | Analytics SQL, against a real ClickHouse | 11 | — |
 | Aggregator | 32 | **99.3%** (CI fails below 90%) |
-| Frontend | 103 | 80.2% of statements, 74.5% of branches |
+| Frontend | 103 | 80.2% of statements, 74.4% of branches |
 | **Total** | **471** | |
 
 The unit suites need no running services. Postgres is replaced by SQLite, and
