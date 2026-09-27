@@ -1,314 +1,261 @@
-# SentryFlow Rate Limiting Documentation
+# Rate limiting
 
-This document provides a comprehensive guide to SentryFlow's rate limiting capabilities, including configuration options, algorithms, and best practices.
+The limiter runs on every gateway request, after the API key has been resolved
+to a user and before the handler runs. It limits each user on each endpoint
+(request path) separately. All state lives in Redis, which every gateway
+replica shares, so a limit holds across the whole fleet rather than per pod.
 
-## Overview
+The code is in [`backend/limiter/rate_limiter.py`](../backend/limiter/rate_limiter.py),
+and the rules API in [`backend/limiter/limits_router.py`](../backend/limiter/limits_router.py).
 
-Rate limiting is a critical component of API management that helps protect your services from abuse, ensures fair usage, and maintains system stability. SentryFlow offers flexible and powerful rate limiting features that can be tailored to your specific needs.
+## Contents
 
-## Rate Limiting Algorithms
+- [Algorithms](#algorithms)
+- [Rules](#rules)
+- [Managing rules](#managing-rules)
+- [Response headers](#response-headers)
+- [What is stored in Redis](#what-is-stored-in-redis)
+- [When Redis is down](#when-redis-is-down)
+- [Testing](#testing)
 
-SentryFlow supports two primary rate limiting algorithms:
+---
 
-### 1. Sliding Window
+## Algorithms
 
-The sliding window algorithm tracks requests over a rolling time window, providing more accurate rate limiting but requiring more memory.
+Each algorithm is one Lua script. Redis runs a script as a single step that
+no other command can interleave with, so reading the counter, deciding and
+writing it back is atomic. The same logic in Python would need a
+`WATCH`/`MULTI` loop that retries whenever another request changes the key
+first, which is exactly what happens when one caller sends many concurrent
+requests.
 
-**How it works:**
-- Maintains a timestamp for each request within the window
-- As time progresses, older timestamps outside the window are discarded
-- New requests are counted against the total within the current window
+Both scripts are deterministic. The current time and the sorted-set member
+are generated in Python and passed in as arguments, never generated inside
+Lua, so the scripts replicate safely.
 
-**Best for:**
-- More precise control over request rates
-- Applications where accuracy is more important than memory usage
-- APIs with moderate traffic volumes
+### Sliding window (default)
 
-### 2. Token Bucket
+At most *N* requests in any trailing window of 60 seconds.
 
-The token bucket algorithm uses a bucket of tokens that refills at a constant rate. Each request consumes a token, and requests are rejected when the bucket is empty.
+Each caller and endpoint has a sorted set with one member per admitted
+request, scored by its timestamp in milliseconds. For each request, the
+script:
 
-**How it works:**
-- A bucket holds a maximum number of tokens
-- Tokens are added to the bucket at a fixed rate
-- Each request consumes one token
-- If the bucket is empty, requests are rejected
+1. removes members older than the window (`ZREMRANGEBYSCORE`);
+2. counts what is left (`ZCARD`);
+3. if the count has reached the limit, rejects the request and works out
+   when the oldest member will age out, which becomes `Retry-After`;
+4. otherwise adds the request (`ZADD`) and sets the key to expire one window
+   later (`PEXPIRE`), so idle callers cost nothing.
 
-**Best for:**
-- Memory-efficient rate limiting
-- Handling traffic spikes (allows bursts up to bucket capacity)
-- High-volume APIs
+A rejected request is not added, so a caller who keeps retrying while
+throttled does not extend their own lockout.
 
-## Configuration Options
+The window slides continuously. A fixed window, reset on the minute, lets a
+caller send the limit just before the boundary and the limit again just after
+it: twice the limit within a second or two. The sliding window cannot be
+gamed that way. The price is memory: one member per admitted request in the
+window, so up to the limit itself.
 
-### Global Rate Limits
+### Token bucket
 
-Global rate limits apply to all endpoints and can be configured in the SentryFlow dashboard or via the API.
+A bucket holds up to `burst_capacity` tokens and refills at
+`requests_per_minute / 60` tokens per second. Each request takes one token;
+with none left, the request is rejected.
 
-```json
-{
-  "global": {
-    "requests_per_minute": 100,
-    "requests_per_hour": 1000,
-    "algorithm": "sliding_window"
-  }
-}
-```
+Each caller and endpoint has a hash with two fields, `tokens` and
+`last_refill_ms`. There is no timer: the script adds the tokens earned since
+the last request, capped at the capacity, then takes one if it can. A
+missing key is a full bucket, so a new caller gets the whole burst.
+`Retry-After` is the time until one token has refilled. The key expires after
+twice the time it takes to refill from empty, and never sooner than 60
+seconds.
 
-### Endpoint-Specific Rate Limits
+The token bucket allows a burst above the steady rate, by design, and its
+memory stays constant however much traffic a caller sends.
 
-You can set different rate limits for specific endpoints based on their sensitivity or resource requirements.
+### Choosing one
 
-```json
-{
-  "endpoints": {
-    "/api/v1/data": {
-      "requests_per_minute": 50,
-      "requests_per_hour": 500,
-      "algorithm": "token_bucket"
-    },
-    "/api/v1/search": {
-      "requests_per_minute": 20,
-      "requests_per_hour": 200,
-      "algorithm": "sliding_window"
-    }
-  }
-}
-```
+Measured with k6 against the compose stack
+([load-testing.md](load-testing.md#sliding-window-vs-token-bucket)):
 
-### User-Based Rate Limits
+| | Sliding window | Token bucket |
+| --- | --- | --- |
+| Admits | at most *N* requests in any trailing 60 s | a burst up to the capacity, then *N* per minute |
+| Work per request | `O(log N)` | `O(1)` |
+| Median latency at 1,000 req/s | 0.66–0.90 ms | 0.64–0.94 ms |
+| Busy caller's key after 30 s | 4.2 MB at 1,000 req/s, 7.7 MB at 2,000 req/s | 186–187 bytes at any rate |
+| Caller allowed 30, sending over 200 | exactly 30 admitted in every run | exactly 30 admitted in every run |
 
-Different users or API keys can have different rate limits based on their tier or requirements.
+The two cost the same per request; memory is the real difference. A sliding
+window holds one member per admitted request, so its size tracks the limit: a
+caller allowed 60 a minute never costs more than 60 members. The load test's
+busy caller had a limit of a million a minute, so every request was admitted
+and stored. At 1,000 requests/s, a full minute of that is 60,000 members. For
+callers with high limits and heavy traffic, prefer the token bucket.
 
-```json
-{
-  "user_tiers": {
-    "free": {
-      "requests_per_minute": 10,
-      "requests_per_hour": 100,
-      "algorithm": "sliding_window"
-    },
-    "premium": {
-      "requests_per_minute": 100,
-      "requests_per_hour": 1000,
-      "algorithm": "token_bucket"
-    },
-    "enterprise": {
-      "requests_per_minute": 1000,
-      "requests_per_hour": 10000,
-      "algorithm": "token_bucket"
-    }
-  }
-}
-```
+---
 
-## Rate Limit Response
+## Rules
 
-When a rate limit is exceeded, SentryFlow returns a standard `429 Too Many Requests` response with additional headers to help clients handle the situation:
-
-```
-HTTP/1.1 429 Too Many Requests
-Content-Type: application/json
-Retry-After: 30
-X-RateLimit-Limit: 60
-X-RateLimit-Remaining: 0
-X-RateLimit-Reset: 1609459200
-
-{
-  "detail": "Rate limit exceeded."
-}
-```
-
-### Response Headers
-
-- `Retry-After`: Seconds until the client can retry the request
-- `X-RateLimit-Limit`: The rate limit ceiling for the given endpoint
-- `X-RateLimit-Remaining`: The number of requests left for the time window
-- `X-RateLimit-Reset`: The time at which the rate limit resets, in Unix time
-
-## Configuring Rate Limits
-
-### Via the dashboard
-
-The **Rate Limit Monitor** page visualises throttling by user and endpoint.
-It currently renders generated data, pending the analytics endpoints listed
-in [the API reference](api.md#not-yet-implemented).
-
-### Via the database
-
-Limits live in the `rate_limits` table, one row per user and endpoint:
+A rule sets one user's limit on one endpoint, or on all of that user's
+endpoints with `*`. Rules live in the `rate_limits` table:
 
 | Column | Meaning |
 | --- | --- |
-| `user_id` | the caller the limit applies to |
-| `endpoint` | an exact path, or `*` as a per-user catch-all |
-| `requests_per_minute` | the ceiling |
-| `burst_capacity` | bucket size, token bucket only |
+| `user_id` | whose limit it is |
+| `endpoint` | an exact request path such as `/api/v1/hello`, or `*` |
+| `requests_per_minute` | the limit; for the token bucket, the refill rate |
+| `burst_capacity` | the bucket size; token bucket only |
 | `algorithm` | `sliding_window` or `token_bucket` |
 
-Resolution order is exact endpoint, then the user's `*` row, then the global
-defaults from the environment. The result is cached in Redis for 60 seconds,
-so a change takes effect within a minute without putting the database in the
-per-request path.
+For each request, the gateway takes the first match from:
 
-`python -m backend.setup_db` seeds a `*` row for the admin user.
+1. the user's rule for this exact path;
+2. the user's `*` rule;
+3. the global defaults, from the environment.
 
-> A management endpoint (`PUT /rate-limits`) is specified in
-> [the API reference](api.md#not-yet-implemented) but not yet built; limits
-> are configured directly in the table today.
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DEFAULT_RATE_LIMIT` | `60` | requests per minute |
+| `DEFAULT_BURST_CAPACITY` | `10` | token-bucket capacity |
+| `DEFAULT_RATE_LIMIT_ALGORITHM` | `sliding_window` | algorithm |
+| `DEFAULT_RATE_LIMIT_WINDOW` | `60` | sliding-window length in seconds, for every rule |
+| `RATE_LIMIT_FAIL_OPEN` | `true` | what to do when Redis is unreachable; see [below](#when-redis-is-down) |
 
-## Monitoring Rate Limits
+The window length applies to every sliding-window rule. It is 60 seconds by
+default, which is what makes `requests_per_minute` literally per minute.
 
-SentryFlow provides several ways to monitor rate limit usage and violations:
+`python -m backend.setup_db` seeds a `*` rule with the defaults for the
+`admin` account, which the dashboard then shows and lets you edit.
 
-### Dashboard Analytics
+### Caching
 
-The SentryFlow dashboard includes visualizations of:
+The database is authoritative, but it stays off the request path. The
+resolved rule is cached in Redis for 60 seconds. When a user has no rule, the
+cache records that they use the defaults, so callers on defaults never query
+the database either.
 
-- Rate limit usage over time
-- Rate limit violations by endpoint
-- Rate limit violations by user/API key
+Changing or deleting a rule through `/limits` deletes every cached result for
+that user, so the change applies from their next request. It has to clear
+every endpoint the user has called, not one key: changing their `*` rule
+changes what each of those endpoints resolves to. If Redis refuses the
+eviction, the change still applies within 60 seconds, when the cache entries
+expire.
 
-### Alerts and Notifications
+---
 
-You can configure alerts to be notified when:
+## Managing rules
 
-- Rate limit usage exceeds a certain percentage (e.g., 80%)
-- Rate limit violations occur more than a specified threshold
-- Specific users or endpoints experience frequent rate limit violations
+**In the dashboard.** The Rate Limit Monitor page lists the rules in force
+and the defaults. Admins add, edit and delete rules there. The same page
+charts allowed and throttled requests over time, and ranks throttling by
+endpoint and (for admins) by user. Other users see only the rules that apply
+to them, read-only.
 
-### Webhooks
+**Through the API.** `GET /limits`, `PUT /limits` and
+`DELETE /limits/{rule_id}`, documented in
+[api.md](api.md#rate-limit-rules). Only admins can write. A customer who
+could raise their own limit would not really have one.
 
-SentryFlow can send webhook notifications when rate limits are exceeded:
-
-```json
-{
-  "event": "rate_limit.exceeded",
-  "created_at": "2023-01-01T12:30:45Z",
-  "data": {
-    "user_id": "user_uuid",
-    "api_key_id": "api_key_uuid",
-    "endpoint": "/api/v1/data",
-    "limit_type": "requests_per_minute",
-    "limit_value": 100,
-    "current_usage": 101
-  }
-}
+```bash
+# Give a user a burst of 20, refilling at 120 requests a minute, on one endpoint
+curl -X PUT localhost:8000/limits \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"user_id": "…", "endpoint": "/api/v1/hello",
+       "requests_per_minute": 120, "burst_capacity": 20, "algorithm": "token_bucket"}'
 ```
 
-## Best Practices
+---
 
-### For API Providers
+## Response headers
 
-1. **Start with conservative limits**: Begin with lower limits and increase them as needed based on usage patterns.
+| Header | Sliding window | Token bucket |
+| --- | --- | --- |
+| `X-RateLimit-Limit` | requests allowed per window | bucket capacity |
+| `X-RateLimit-Remaining` | requests left in the window | whole tokens left |
+| `X-RateLimit-Reset` | Unix time: one window from now if allowed; when the oldest request ages out if rejected | Unix time at which the bucket is full again |
+| `Retry-After` (on `429` only) | seconds until the oldest request ages out | seconds until one token has refilled |
 
-2. **Use different limits for different endpoints**: Resource-intensive endpoints should have lower limits than lightweight ones.
+A rejected request gets:
 
-3. **Implement tiered rate limiting**: Offer different rate limits for different user tiers or subscription levels.
+```
+HTTP/1.1 429 Too Many Requests
+X-RateLimit-Limit: 60
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1790253660
+Retry-After: 12
 
-4. **Monitor and analyze**: Regularly review rate limit violations to identify potential abuse or legitimate needs for higher limits.
+{"detail": "Rate limit exceeded."}
+```
 
-5. **Communicate clearly**: Ensure your rate limit policies are clearly documented for API consumers.
-
-### For API Consumers
-
-1. **Implement retry logic**: When receiving a 429 response, implement exponential backoff with jitter:
+Clients should wait for `Retry-After` rather than retry at once:
 
 ```python
 import time
-import random
 
-def make_request_with_retry(url, max_retries=5):
-    retries = 0
-    while retries < max_retries:
-        response = requests.get(url)
-        if response.status_code != 429:  # Not rate limited
+import requests
+
+
+def get_with_retry(url, api_key, attempts=5):
+    for _ in range(attempts):
+        response = requests.get(url, headers={"x-api-key": api_key})
+        if response.status_code != 429:
             return response
-        
-        # Parse retry time from headers, default to exponential backoff
-        retry_after = int(response.headers.get('Retry-After', 2 ** retries))
-        # Add jitter to prevent thundering herd problem
-        sleep_time = retry_after + (random.randint(0, 1000) / 1000.0)
-        time.sleep(sleep_time)
-        retries += 1
-    
-    # Max retries exceeded
+        time.sleep(int(response.headers.get("Retry-After", "1")))
     return response
 ```
 
-2. **Cache responses**: Reduce the number of API calls by caching responses when appropriate.
+---
 
-3. **Batch requests**: Combine multiple operations into a single API call when possible.
+## What is stored in Redis
 
-4. **Monitor your usage**: Keep track of your API usage to avoid hitting rate limits.
+| Key | Type | Holds | Expires |
+| --- | --- | --- | --- |
+| `rate:sliding_window:{user}:{endpoint}` | sorted set | one member per admitted request | one window after the last admitted request |
+| `rate:token_bucket:{user}:{endpoint}` | hash | `tokens`, `last_refill_ms` | twice the time to refill from empty, at least 60 s |
+| `ratelimit:cfg:{user}:{endpoint}` | string | the resolved rule, or a marker meaning "use the defaults" | 60 s |
+| `apikey:{key}` | string | the key's user, or a marker meaning "no such key" | 1 hour; 60 s for unknown keys |
 
-5. **Distribute traffic**: If possible, distribute requests evenly over time rather than sending them in bursts.
+The algorithm is part of the counter's key, so switching a user to the other
+algorithm starts them with fresh state instead of misreading the old one.
 
-## Advanced Configuration
+---
 
-### Custom Rate Limit Keys
+## When Redis is down
 
-SentryFlow allows you to define custom keys for rate limiting beyond the default user/API key and endpoint combinations:
+With `RATE_LIMIT_FAIL_OPEN=true`, the default, requests are served without
+enforcement. Losing the rate limiter should weaken enforcement, not take the
+API down. Set it to `false` where over-admission is worse than downtime:
+requests are then rejected with `429` and `Retry-After: 1`.
 
-```json
-{
-  "custom_keys": {
-    "ip_address": {
-      "requests_per_minute": 50,
-      "requests_per_hour": 500
-    },
-    "user_agent": {
-      "requests_per_minute": 200,
-      "requests_per_hour": 2000
-    }
-  }
-}
-```
+Either way, the `X-RateLimit-*` headers are left out of the response. A
+limit of `0` would read as "you have no quota", and clients throttle
+themselves on these headers, when the truth is that nothing was enforced.
 
-### Rate Limit Groups
+Authentication never fails open. If Redis cannot answer, API keys are looked
+up in the database on every request: slower, but still correct.
 
-You can create groups of endpoints that share the same rate limit bucket:
+---
 
-```json
-{
-  "endpoint_groups": {
-    "read_operations": {
-      "endpoints": ["/api/v1/data/get", "/api/v1/search"],
-      "requests_per_minute": 100,
-      "requests_per_hour": 1000
-    },
-    "write_operations": {
-      "endpoints": ["/api/v1/data/create", "/api/v1/data/update"],
-      "requests_per_minute": 50,
-      "requests_per_hour": 500
-    }
-  }
-}
-```
+## Testing
 
-### Dynamic Rate Limiting
-
-SentryFlow supports dynamic rate limiting based on server load or other metrics:
-
-```json
-{
-  "dynamic_limits": {
-    "enabled": true,
-    "scaling_factor": 0.5,  // Reduce limits by 50% when triggered
-    "triggers": {
-      "server_load": {
-        "threshold": 0.8,  // 80% CPU usage
-        "window": 60  // Measured over 60 seconds
-      },
-      "error_rate": {
-        "threshold": 0.05,  // 5% error rate
-        "window": 300  // Measured over 5 minutes
-      }
-    }
-  }
-}
-```
-
-## Conclusion
-
-Effective rate limiting is essential for maintaining the stability, security, and fairness of your API. SentryFlow provides flexible and powerful rate limiting capabilities that can be tailored to your specific needs. By following the best practices outlined in this document, you can implement rate limiting that protects your services while providing a good experience for your API consumers.
+- [`backend/tests/test_rate_limiter.py`](../backend/tests/test_rate_limiter.py)
+  (35 tests) runs both Lua scripts in `fakeredis`, which executes real Lua.
+  It covers:
+  - the window boundary, where a fixed window would allow a double burst;
+  - refill, and capping at the bucket's capacity;
+  - `Retry-After` and reset times;
+  - the order in which rules resolve, and caching them, including the
+    "no rule" result;
+  - evicting a user's cached rules;
+  - failing open, and failing closed.
+- [`backend/tests/test_limits.py`](../backend/tests/test_limits.py) (19
+  tests) covers the rules API:
+  - who may read and who may write;
+  - validation, and two admins creating the same rule at once;
+  - a lowered limit, or a deleted rule, taking effect on the very next
+    request through the gateway.
+- [`loadtest/gateway.js`](../loadtest/gateway.js) checks exactness under real
+  concurrency for either algorithm. It also checks the token bucket's refill
+  ([load-testing.md](load-testing.md)).

@@ -132,7 +132,7 @@ curl -i localhost:8000/api/v1/hello -H "x-api-key: $KEY"
 | --- | --- |
 | `X-RateLimit-Limit` | ceiling for this caller and endpoint |
 | `X-RateLimit-Remaining` | requests left in the current window |
-| `X-RateLimit-Reset` | Unix time at which full quota returns |
+| `X-RateLimit-Reset` | Unix time at which quota returns ([per algorithm](rate-limiting.md#response-headers)) |
 | `Retry-After` | seconds to wait; sent only on `429` |
 
 While the limiter is degraded (Redis unreachable) the `X-RateLimit-*` headers

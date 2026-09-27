@@ -65,8 +65,9 @@ bounded by the aggregator's 2-second flush interval.
   Helm chart's HPA scales the gateway from 3 to 12 replicas, and all replicas
   share one Redis, so limits hold across them.
 - **This measures gateway overhead, not a backend.** `/api/v1/hello` does no
-  work, so the time is the gateway itself: two Redis round trips (cached key
-  lookup, the Lua limiter script) and queueing an event for the Kafka publisher.
+  work, so the time is the gateway itself: three Redis round trips (the cached
+  key lookup, the cached rule lookup and the Lua limiter script) and queueing
+  an event for the Kafka publisher.
   A proxied upstream adds its own latency on top.
 - **It is a laptop, not AWS.** There is no network hop, TLS or load balancer
   between k6 and the gateway, and every dependency shares the same machine.
@@ -146,7 +147,9 @@ other, not with the tables above.
   instead of 5, because the overloaded gateway spread the second burst over
   seconds and more tokens had refilled by the time those requests were checked.
 - **Memory is the real difference.** The sliding window keeps one sorted-set
-  member per request in the window. After 30 s the busy caller's key held
+  member per admitted request in the window. The busy caller's limit was a
+  million a minute, so every request was kept. After 30 s its key held
   4.2 MB at 1,000/s, 6.1–6.4 MB at 1,500/s and 7.7 MB at 2,000/s. A full
-  minute of traffic doubles that, and it is per caller. The token bucket's
-  key was 186–187 bytes in every run.
+  minute of traffic doubles that, and it is per caller. The size is bounded by
+  the limit, so it only matters for callers with high limits. The token
+  bucket's key was 186–187 bytes in every run.
