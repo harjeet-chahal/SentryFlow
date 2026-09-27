@@ -36,6 +36,7 @@ RANGES = {
 
 TOP_N = 10
 MAX_LOG_ROWS = 1000
+MAX_USERS_PAGE = 200
 
 _ERROR = "status_code >= 400 AND status_code != 429"
 _SERVED = "status_code != 429"
@@ -333,31 +334,48 @@ async def logs(
     }
 
 
-async def per_user(window: Window) -> Dict[str, Dict[str, Any]]:
-    """Traffic per user in the window, keyed by user id."""
-    rows = await query(
-        "per_user",
-        f"""
-        SELECT
-            user_id,
-            count(),
-            countIf({_ERROR}),
-            countIf(status_code = 429),
-            quantileIf(0.95)(response_time, {_SERVED}),
-            toUnixTimestamp(max(timestamp))
-        FROM api_usage
-        WHERE {_where(window, None)}
-        GROUP BY user_id
-        """,
-        _params(window, None),
+async def top_users(window: Window, limit: int, offset: int) -> Dict[str, Any]:
+    """One page of the users with traffic in the window, busiest first.
+
+    ClickHouse ranks and pages, so a page costs the same however many users
+    there are. Ties break on user id, which keeps pages stable.
+    """
+    rows, count = await asyncio.gather(
+        query(
+            "top_users",
+            f"""
+            SELECT
+                user_id,
+                count() AS requests,
+                countIf({_ERROR}),
+                countIf(status_code = 429),
+                quantileIf(0.95)(response_time, {_SERVED}),
+                toUnixTimestamp(max(timestamp))
+            FROM api_usage
+            WHERE {_where(window, None)}
+            GROUP BY user_id
+            ORDER BY requests DESC, user_id
+            LIMIT %(limit)s OFFSET %(offset)s
+            """,
+            _params(window, None, limit=limit, offset=offset),
+        ),
+        query(
+            "active_users",
+            f"SELECT uniqExact(user_id) FROM api_usage WHERE {_where(window, None)}",
+            _params(window, None),
+        ),
     )
     return {
-        user_id: {
-            "requests": requests,
-            "errors": errors,
-            "rate_limited": rate_limited,
-            "p95_ms": _ms(p95_ms),
-            "last_seen": last_seen,
-        }
-        for user_id, requests, errors, rate_limited, p95_ms, last_seen in rows
+        "total": count[0][0] if count else 0,
+        "users": [
+            {
+                "user_id": user_id,
+                "requests": requests,
+                "errors": errors,
+                "rate_limited": rate_limited,
+                "p95_ms": _ms(p95_ms),
+                "last_seen": last_seen,
+            }
+            for user_id, requests, errors, rate_limited, p95_ms, last_seen in rows
+        ],
     }

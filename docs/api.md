@@ -69,6 +69,20 @@ token rather than a refresh token.
 Requires a bearer token. Returns the authenticated user, including
 `is_admin`, which the dashboard uses to decide what to show.
 
+### `GET /auth/users`
+
+Admins only. Accounts in username order, for choosing a user. `search`
+matches part of a username or email, case-insensitively; `limit` (1–100,
+default 20) and `offset` page through the matches, and `total` counts them.
+The dashboard's user pickers search here rather than load every account.
+
+```json
+{ "total": 2, "users": [
+  { "id": "…", "username": "alice", "email": "alice@example.com",
+    "is_active": true, "is_admin": false, "created_at": "2026-09-24T12:00:00" }
+] }
+```
+
 ---
 
 ## API keys
@@ -260,11 +274,16 @@ The newest matching requests, newest first. Filters run in ClickHouse:
 
 ### `GET /analytics/users`
 
-Admins only. Every account with its traffic in the range, busiest first;
-accounts with no traffic are included with zeros and `last_seen: null`.
+Admins only. Users with traffic in the range, busiest first, a page at a time:
+`limit` (1–200, default 50) and `offset`. `total` counts every user with
+traffic in the range. ClickHouse ranks and pages, and only the page's
+accounts are read from the database, so a page costs the same however many
+users there are. Accounts with no traffic are not listed (see
+`GET /auth/users`). Traffic from a deleted account is listed with
+`username: null`.
 
 ```json
-{ "range": "24h", "users": [
+{ "range": "24h", "total": 1, "limit": 50, "offset": 0, "users": [
   { "id": "…", "username": "demo", "email": "demo@example.com", "is_active": true,
     "is_admin": false, "requests": 500, "errors": 2, "rate_limited": 20,
     "p95_ms": 2.4, "last_seen": 1790253600 }

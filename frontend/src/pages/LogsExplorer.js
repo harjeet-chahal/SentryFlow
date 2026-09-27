@@ -2,9 +2,11 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ArrowPathIcon } from '@heroicons/react/24/outline';
 import { useAuth } from '../components/auth/AuthContext';
 import TimeRangePicker from '../components/TimeRangePicker';
+import UserPicker from '../components/UserPicker';
 import { PageHeader, PageSpinner, ErrorState } from '../components/ui';
 import { formatDateTime, formatNumber, rangeDescription } from '../utils/analytics';
 import { getJson } from '../utils/api';
+import useDebouncedValue from '../utils/useDebouncedValue';
 import usePolling from '../utils/usePolling';
 
 const LOGS_PER_PAGE = 25;
@@ -12,16 +14,6 @@ const ROW_LIMITS = [100, 200, 500, 1000];
 
 const selectClass = 'form-input sm:text-sm disabled:bg-gray-100 disabled:text-gray-500';
 const th = 'px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider';
-
-// Returns `value` once it has stopped changing for `delayMs`.
-const useDebouncedValue = (value, delayMs) => {
-  const [debounced, setDebounced] = useState(value);
-  useEffect(() => {
-    const timer = setTimeout(() => setDebounced(value), delayMs);
-    return () => clearTimeout(timer);
-  }, [value, delayMs]);
-  return debounced;
-};
 
 const getStatusCodeClass = (statusCode) => {
   if (statusCode === 429) return 'bg-orange-100 text-orange-800';
@@ -77,17 +69,6 @@ const LogsExplorer = () => {
     [authAxios, range, statusFilter, endpointFilter, userId, limit, isAdmin]
   );
   const { data, error, loading, refreshing, isStale, refresh } = usePolling(fetchLogs);
-
-  // Admins can narrow the logs to one user.
-  const fetchUsers = useCallback(
-    (signal) => getJson(authAxios, '/analytics/users', { params: { range: '30d' }, signal }),
-    [authAxios]
-  );
-  const users = usePolling(isAdmin ? fetchUsers : null);
-  const userOptions = useMemo(
-    () => [...(users.data?.users ?? [])].sort((a, b) => String(a.username).localeCompare(String(b.username))),
-    [users.data]
-  );
 
   const rows = useMemo(() => (Array.isArray(data?.rows) ? data.rows : []), [data]);
   const totalPages = Math.max(1, Math.ceil(rows.length / LOGS_PER_PAGE));
@@ -166,20 +147,13 @@ const LogsExplorer = () => {
               <label htmlFor="user-filter" className="block text-sm font-medium text-gray-700 mb-1">
                 User
               </label>
-              <select
+              <UserPicker
                 id="user-filter"
                 className={selectClass}
                 value={userId}
-                onChange={(e) => setUserId(e.target.value)}
-                disabled={Boolean(users.error)}
-              >
-                <option value="">{users.error ? 'User list unavailable' : 'All users'}</option>
-                {userOptions.map((u) => (
-                  <option key={u.id} value={u.id}>
-                    {u.username}
-                  </option>
-                ))}
-              </select>
+                onChange={setUserId}
+                emptyLabel="All users"
+              />
             </div>
           )}
 

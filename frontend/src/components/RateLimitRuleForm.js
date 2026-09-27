@@ -1,5 +1,6 @@
-import React, { useMemo, useState } from 'react';
+import React, { useState } from 'react';
 import { useAuth } from './auth/AuthContext';
+import UserPicker from './UserPicker';
 import { ALGORITHMS, MAX_LIMIT_VALUE, validateRuleInput } from '../utils/limits';
 import { apiErrorMessage } from '../utils/api';
 
@@ -8,7 +9,7 @@ const inputClass = 'form-input mt-1 sm:text-sm disabled:bg-gray-100 disabled:tex
 // Admin form that creates or updates a rule with PUT /limits. A rule is keyed
 // by (user, endpoint), so both are locked while editing an existing rule.
 // Remount it (change `key`) to reset it.
-const RateLimitRuleForm = ({ rule, defaults, users, usersLoading, usersError, onSaved, onCancel }) => {
+const RateLimitRuleForm = ({ rule, defaults, onSaved, onCancel }) => {
   const { authAxios } = useAuth();
   const editing = Boolean(rule);
   const [form, setForm] = useState(() => ({
@@ -20,11 +21,6 @@ const RateLimitRuleForm = ({ rule, defaults, users, usersLoading, usersError, on
   }));
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState(null);
-
-  const userOptions = useMemo(
-    () => [...(users ?? [])].sort((a, b) => String(a.username).localeCompare(String(b.username))),
-    [users]
-  );
 
   const update = (field) => (event) => setForm((prev) => ({ ...prev, [field]: event.target.value }));
 
@@ -47,42 +43,17 @@ const RateLimitRuleForm = ({ rule, defaults, users, usersLoading, usersError, on
     }
   };
 
-  let userField;
-  if (editing) {
-    userField = <input id="rule-user" className={inputClass} value={rule.username ?? rule.user_id} disabled />;
-  } else if (usersError) {
-    // The user list comes from the analytics store; fall back to a raw ID.
-    userField = (
-      <>
-        <input
-          id="rule-user"
-          className={inputClass}
-          placeholder="User ID"
-          value={form.user_id}
-          onChange={update('user_id')}
-        />
-        <p className="mt-1 text-xs text-amber-700">Couldn't load the user list; enter the user's ID instead.</p>
-      </>
-    );
-  } else {
-    userField = (
-      <select
-        id="rule-user"
-        className={inputClass}
-        value={form.user_id}
-        onChange={update('user_id')}
-        disabled={usersLoading}
-      >
-        <option value="">{usersLoading ? 'Loading users…' : 'Select a user'}</option>
-        {userOptions.map((u) => (
-          <option key={u.id} value={u.id}>
-            {u.username}
-            {u.email ? ` (${u.email})` : ''}
-          </option>
-        ))}
-      </select>
-    );
-  }
+  const userField = editing ? (
+    <input id="rule-user" className={inputClass} value={rule.username ?? rule.user_id} disabled />
+  ) : (
+    <UserPicker
+      id="rule-user"
+      className={inputClass}
+      value={form.user_id}
+      onChange={(userId) => setForm((prev) => ({ ...prev, user_id: userId }))}
+      emptyLabel="Select a user"
+    />
+  );
 
   return (
     <form onSubmit={handleSubmit} className="space-y-4" noValidate>

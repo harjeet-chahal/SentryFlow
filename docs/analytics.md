@@ -119,7 +119,7 @@ view holding `quantileState` per user, endpoint and minute.
 | Dashboard | `/analytics/usage` | requests, error rate, throttling, p95/p99 latency; requests and latency over time; status mix; busiest endpoints |
 | Rate Limit Monitor | `/analytics/rate-limits`, `/limits` | allowed vs throttled over time; throttling by endpoint and (admins) by user; the rules in force, editable by admins |
 | Logs | `/analytics/logs` | recent requests, filtered in ClickHouse by status class, endpoint and (admins) user |
-| Users | `/analytics/users` | admins only: every account with its traffic, drilling into one user's charts |
+| Users | `/analytics/users` | admins only: users with traffic, busiest first, 50 to a page; drilling into one user's charts |
 | API Keys | `/auth/apikeys` | create and revoke keys |
 
 The Dashboard and Rate Limit Monitor refresh every 10 seconds. An event is

@@ -18,6 +18,11 @@ import usePolling from '../utils/usePolling';
 
 const th = 'px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider';
 const td = 'px-6 py-4 whitespace-nowrap text-sm text-gray-500';
+const pagerButton =
+  'px-3 py-1 rounded-md bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:hover:bg-white';
+
+// Users per page. The server ranks and pages, so this is all it sends.
+export const USERS_PER_PAGE = 50;
 
 // Non-admins never call the admin-only endpoints.
 const AdminOnlyNotice = () => (
@@ -39,6 +44,9 @@ const AdminOnlyNotice = () => (
     </div>
   </div>
 );
+
+// Traffic can outlive its account; the id is all that is left of it.
+const displayName = (user) => user.username ?? user.id;
 
 const LastSeen = ({ epochSeconds }) => {
   const date = epochToDate(epochSeconds);
@@ -80,9 +88,13 @@ const UsersTable = ({ users, selectedId, onSelect }) => (
             >
               <td className={td}>
                 <div className="flex items-center gap-2">
-                  <span className="font-medium text-gray-900">{u.username}</span>
+                  <span className="font-medium text-gray-900">{displayName(u)}</span>
                   {u.is_admin && <Badge tone="blue">Admin</Badge>}
-                  {u.is_active === false && <Badge tone="gray">Inactive</Badge>}
+                  {u.username === null ? (
+                    <Badge tone="gray">Deleted</Badge>
+                  ) : (
+                    u.is_active === false && <Badge tone="gray">Inactive</Badge>
+                  )}
                 </div>
                 {u.email && <div className="text-xs text-gray-500">{u.email}</div>}
               </td>
@@ -101,6 +113,22 @@ const UsersTable = ({ users, selectedId, onSelect }) => (
   </div>
 );
 
+const Pager = ({ offset, count, total, onPrevious, onNext }) => (
+  <div className="flex items-center justify-between px-6 py-3 border-t border-gray-200 text-sm text-gray-600">
+    <span>
+      {formatNumber(offset + 1)}–{formatNumber(offset + count)} of {formatNumber(total)}
+    </span>
+    <div className="flex gap-2">
+      <button type="button" className={pagerButton} onClick={onPrevious} disabled={offset === 0}>
+        Previous
+      </button>
+      <button type="button" className={pagerButton} onClick={onNext} disabled={offset + count >= total}>
+        Next
+      </button>
+    </div>
+  </div>
+);
+
 const SelectedUserUsage = ({ user, usage, rangeText }) => {
   const { data, error, loading, isStale, refresh, refreshing } = usage;
   if (loading) return <PageSpinner />;
@@ -111,7 +139,7 @@ const SelectedUserUsage = ({ user, usage, rangeText }) => {
     <div className={`space-y-6 transition-opacity ${isStale ? 'opacity-50' : ''}`} aria-busy={isStale}>
       {!summary.requests ? (
         <div className="bg-white shadow rounded-lg p-6 text-sm text-gray-600">
-          {user.username} made no requests in the {rangeText}.
+          {displayName(user)} made no requests in the {rangeText}.
         </div>
       ) : (
         <>
@@ -133,19 +161,24 @@ const SelectedUserUsage = ({ user, usage, rangeText }) => {
 const AdminUserView = () => {
   const { authAxios } = useAuth();
   const [range, setRange] = useState(DEFAULT_RANGE);
-  const [selectedId, setSelectedId] = useState(null);
+  const [offset, setOffset] = useState(0);
+  // Kept as a whole user, so the charts stay put while the table pages on.
+  const [selectedUser, setSelectedUser] = useState(null);
+  const selectedId = selectedUser?.id ?? null;
 
   const fetchUsers = useCallback(
-    (signal) => getJson(authAxios, '/analytics/users', { params: { range }, signal }),
-    [authAxios, range]
+    (signal) =>
+      getJson(authAxios, '/analytics/users', { params: { range, limit: USERS_PER_PAGE, offset }, signal }),
+    [authAxios, range, offset]
   );
   const usersQuery = usePolling(fetchUsers);
   const users = useMemo(() => usersQuery.data?.users ?? [], [usersQuery.data]);
+  const total = usersQuery.data?.total ?? users.length;
 
   // Start with the busiest user selected.
   useEffect(() => {
-    if (!selectedId && users.length > 0) setSelectedId(users[0].id);
-  }, [selectedId, users]);
+    if (!selectedUser && users.length > 0) setSelectedUser(users[0]);
+  }, [selectedUser, users]);
 
   const fetchUserUsage = useCallback(
     (signal) => getJson(authAxios, '/analytics/usage', { params: { range, user_id: selectedId }, signal }),
@@ -153,13 +186,18 @@ const AdminUserView = () => {
   );
   const usage = usePolling(selectedId ? fetchUserUsage : null);
 
-  const selectedUser = users.find((u) => u.id === selectedId);
+  // A new range ranks users afresh, so start again from the busiest.
+  const changeRange = (next) => {
+    setRange(next);
+    setOffset(0);
+  };
+  const selectUser = (id) => setSelectedUser(users.find((u) => u.id === id) ?? null);
   const rangeText = rangeDescription(range);
 
   return (
     <div className="space-y-6">
       <PageHeader title="User View" subtitle={<span>Per-user traffic in the {rangeText}</span>}>
-        <TimeRangePicker value={range} onChange={setRange} />
+        <TimeRangePicker value={range} onChange={changeRange} />
       </PageHeader>
 
       {usersQuery.loading && <PageSpinner />}
@@ -174,13 +212,21 @@ const AdminUserView = () => {
         >
           <div className="px-4 py-5 sm:px-6">
             <h2 className="text-lg font-medium text-gray-900">Users</h2>
-            <p className="mt-1 text-sm text-gray-500">Sorted by requests. Select a user to see their traffic.</p>
+            <p className="mt-1 text-sm text-gray-500">Busiest first. Select a user to see their charts.</p>
           </div>
           {users.length === 0 ? (
-            <p className="px-6 pb-6 text-sm text-gray-500">No users yet.</p>
+            <p className="px-6 pb-6 text-sm text-gray-500">No traffic in the {rangeText}.</p>
           ) : (
             <div className="border-t border-gray-200">
-              <UsersTable users={users} selectedId={selectedId} onSelect={setSelectedId} />
+              <UsersTable users={users} selectedId={selectedId} onSelect={selectUser} />
+              <Pager
+                // The rows on screen, which lag the requested page while it loads.
+                offset={usersQuery.data.offset ?? offset}
+                count={users.length}
+                total={total}
+                onPrevious={() => setOffset(Math.max(0, offset - USERS_PER_PAGE))}
+                onNext={() => setOffset(offset + USERS_PER_PAGE)}
+              />
             </div>
           )}
         </div>
@@ -189,7 +235,7 @@ const AdminUserView = () => {
       {selectedUser && (
         <div className="space-y-4">
           <h2 className="text-xl font-semibold text-gray-900">
-            {selectedUser.username}
+            {displayName(selectedUser)}
             <span className="ml-2 text-sm font-normal text-gray-500">in the {rangeText}</span>
           </h2>
           <SelectedUserUsage user={selectedUser} usage={usage} rangeText={rangeText} />

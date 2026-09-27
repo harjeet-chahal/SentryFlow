@@ -13,10 +13,11 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from backend.auth.schemas import (
@@ -25,6 +26,7 @@ from backend.auth.schemas import (
     RefreshRequest,
     TokenResponse,
     UserCreate,
+    UserDirectory,
     UserResponse,
 )
 from backend.config import JWT_SECRET, settings
@@ -279,3 +281,33 @@ async def revoke_api_key(
 @router.get("/me", response_model=UserResponse)
 async def get_current_user_info(current_user: User = Depends(get_current_user)):
     return current_user
+
+
+def _contains(text: str) -> str:
+    """A LIKE pattern matching ``text`` anywhere, with wildcards taken literally."""
+    escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+@router.get("/users", response_model=UserDirectory)
+def list_users(
+    search: Optional[str] = Query(None, max_length=100, description="Part of a username or email"),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    _admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Accounts in username order, for administrators choosing a user.
+
+    Searched and paged in the database, so a picker never loads every
+    account to show a few.
+    """
+    query = db.query(User)
+    if search:
+        pattern = _contains(search)
+        query = query.filter(
+            or_(User.username.ilike(pattern, escape="\\"), User.email.ilike(pattern, escape="\\"))
+        )
+    total = query.count()
+    users = query.order_by(User.username).offset(offset).limit(limit).all()
+    return {"total": total, "users": users}

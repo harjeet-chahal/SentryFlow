@@ -99,27 +99,43 @@ async def request_logs(
     }
 
 
-@router.get("/users")
-async def users(
-    range_: TimeRange = _RANGE,
-    _admin: User = Depends(get_current_admin),
-    db: Session = Depends(get_db),
-):
-    """Every account with its traffic in the range. Administrators only."""
-    window = queries.window_for(range_)
-    stats = await queries.per_user(window)
-    idle = {"requests": 0, "errors": 0, "rate_limited": 0, "p95_ms": None, "last_seen": None}
-
-    accounts = [
-        {
-            "id": user.id,
+def _accounts(db: Session, ids: List[str]) -> Dict[str, dict]:
+    users = db.query(User).filter(User.id.in_(ids)).all() if ids else []
+    return {
+        user.id: {
             "username": user.username,
             "email": user.email,
             "is_active": bool(user.is_active),
             "is_admin": bool(user.is_admin),
-            **stats.get(user.id, idle),
         }
-        for user in await run_in_threadpool(lambda: db.query(User).all())
-    ]
-    accounts.sort(key=lambda account: (-account["requests"], account["username"] or ""))
-    return {"range": range_, "users": accounts}
+        for user in users
+    }
+
+
+# Traffic outlives the account it came from.
+_DELETED = {"username": None, "email": None, "is_active": False, "is_admin": False}
+
+
+@router.get("/users")
+async def users(
+    range_: TimeRange = _RANGE,
+    limit: int = Query(50, ge=1, le=queries.MAX_USERS_PAGE),
+    offset: int = Query(0, ge=0),
+    _admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Users with traffic in the range, busiest first, a page at a time.
+
+    Administrators only. ``total`` counts every user with traffic. Accounts
+    without any are not listed; ``/auth/users`` lists every account.
+    """
+    window = queries.window_for(range_)
+    page = await queries.top_users(window, limit, offset)
+    accounts = await run_in_threadpool(_accounts, db, [row["user_id"] for row in page["users"]])
+
+    listed = []
+    for row in page["users"]:
+        stats = dict(row)
+        user_id = stats.pop("user_id")
+        listed.append({"id": user_id, **accounts.get(user_id, _DELETED), **stats})
+    return {"range": range_, "total": page["total"], "limit": limit, "offset": offset, "users": listed}

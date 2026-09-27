@@ -136,10 +136,10 @@ cd frontend && npm test       # dashboard helpers and pages
 
 | Suite | Tests | Coverage |
 | --- | ---: | ---: |
-| Backend | 252 | **94%** statement and branch (CI floor 90%) |
+| Backend | 292 | **95%** statement and branch (CI floor 90%) |
 | Aggregator | 32 | 99% (CI floor 90%) |
 | Analytics SQL, against real ClickHouse | 11 | — |
-| Frontend | 97 | — |
+| Frontend | 103 | — |
 
 The unit suites need no running services. Postgres is replaced by SQLite;
 Redis by `fakeredis`, which runs the real Lua scripts, so the limiter
@@ -156,11 +156,11 @@ read as uncovered even though `tests/test_gateway.py` drives them over HTTP.
 Beyond happy paths, the suites cover: sliding-window boundary behaviour,
 token-bucket refill and capping, fail-open and fail-closed on a Redis outage,
 refresh tokens rejected as access tokens, forged and expired tokens, per-user
-data scoping and admin-only writes, limit changes applying on the very next
-request, revocation evicting the cache, a stalled Kafka broker not slowing
-callers, reconnecting to a Kafka that starts late, at-least-once commit
-ordering in the aggregator, and password hashing and database queries staying
-off the event loop.
+data scoping and admin-only writes, paging users without loading every
+account, limit changes applying on the very next request, revocation evicting
+the cache, a stalled Kafka broker not slowing callers, reconnecting to a Kafka
+that starts late, at-least-once commit ordering in the aggregator, and
+password hashing and database queries staying off the event loop.
 
 ---
 

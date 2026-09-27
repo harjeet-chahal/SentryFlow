@@ -292,3 +292,56 @@ async def test_signup_hashes_the_password_off_the_event_loop(app, monkeypatch):
 
     assert response.status_code == 201
     assert threads and threading.get_ident() not in threads
+
+
+# --------------------------------------------------------------------------
+# User directory
+# --------------------------------------------------------------------------
+
+def test_the_user_directory_is_for_admins_only(client, user):
+    assert client.get("/auth/users").status_code == 401
+    assert client.get("/auth/users", headers=user["headers"]).status_code == 403
+
+
+def test_the_user_directory_pages_accounts_by_username(client, admin, user_factory):
+    for name in ("carol", "alice", "bob"):
+        user_factory(username=name)
+
+    first = client.get("/auth/users?limit=2", headers=admin["headers"]).json()
+    rest = client.get("/auth/users?limit=2&offset=2", headers=admin["headers"]).json()
+
+    assert first["total"] == rest["total"] == 4
+    assert [u["username"] for u in first["users"]] == ["alice", "bob"]
+    assert [u["username"] for u in rest["users"]] == ["carol", "operator"]
+    assert set(first["users"][0]) >= {"id", "username", "email", "is_active", "is_admin"}
+    assert "hashed_password" not in first["users"][0]
+
+
+def test_the_user_directory_searches_usernames_and_emails(client, admin, user_factory):
+    user_factory(username="alice", email="alice@acme.example.com")
+    user_factory(username="bob", email="bob@ACME.example.com")
+    user_factory(username="carol", email="carol@example.org")
+
+    def names(search):
+        body = client.get("/auth/users", params={"search": search}, headers=admin["headers"]).json()
+        return [u["username"] for u in body["users"]], body["total"]
+
+    assert names("acme") == (["alice", "bob"], 2)  # email, case-insensitively
+    assert names("CAR") == (["carol"], 1)  # username, case-insensitively
+    assert names("nobody") == ([], 0)
+
+
+def test_the_user_directory_takes_wildcards_literally(client, admin, user_factory):
+    user_factory(username="under_score")
+    user_factory(username="underxscore")
+
+    body = client.get("/auth/users", params={"search": "under_"}, headers=admin["headers"]).json()
+    assert [u["username"] for u in body["users"]] == ["under_score"]
+
+    body = client.get("/auth/users", params={"search": "%"}, headers=admin["headers"]).json()
+    assert body["users"] == []
+
+
+@pytest.mark.parametrize("query", ["limit=0", "limit=101", "offset=-1", f"search={'x' * 101}"])
+def test_the_user_directory_rejects_bad_parameters(client, admin, query):
+    assert client.get(f"/auth/users?{query}", headers=admin["headers"]).status_code == 422

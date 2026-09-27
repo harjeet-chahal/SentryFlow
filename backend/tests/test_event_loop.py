@@ -48,7 +48,7 @@ def accounts(client, user, admin, api_key, fake_clickhouse):
     """A user with a key and a rate-limit rule, and analytics that name them."""
     fake_clickhouse.results["throttled_by_user"] = [(user["id"], 10, 5)]
     fake_clickhouse.results["logs"] = [(NOW, user["id"], "/api/v1/hello", 200, 3)]
-    fake_clickhouse.results["per_user"] = [(user["id"], 10, 0, 0, 1.0, NOW)]
+    fake_clickhouse.results["top_users"] = [(user["id"], 10, 0, 0, 1.0, NOW)]
     rule = client.put("/limits", headers=admin["headers"], json=_rule(user["id"])).json()
     return SimpleNamespace(user=user, admin=admin, api_key=api_key, rule=rule)
 
@@ -80,6 +80,7 @@ ROUTES = {
     ),
     "POST /auth/refresh": lambda a: ("POST", "/auth/refresh", {"json": {"refresh_token": a.user["refresh_token"]}}),
     "GET /auth/me": lambda a: ("GET", "/auth/me", {"headers": a.user["headers"]}),
+    "GET /auth/users": lambda a: ("GET", "/auth/users?search=test", {"headers": a.admin["headers"]}),
     "GET /auth/apikeys": lambda a: ("GET", "/auth/apikeys", {"headers": a.user["headers"]}),
     "POST /auth/apikeys/create": lambda a: (
         "POST",
