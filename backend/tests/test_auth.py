@@ -251,6 +251,51 @@ def test_revoking_a_missing_key_is_a_404(client, user):
 
 
 # --------------------------------------------------------------------------
+# Gateway tokens, traded for API keys
+# --------------------------------------------------------------------------
+
+def test_an_api_key_buys_a_short_lived_gateway_token(client, user, api_key):
+    response = client.post("/auth/token", headers={"x-api-key": api_key["key"]})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["token_type"] == "bearer"
+    assert body["expires_in"] == settings.GATEWAY_TOKEN_EXPIRE_MINUTES * 60
+
+    claims = jwt.decode(body["access_token"], JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+    assert claims["type"] == "gateway"
+    assert claims["sub"] == user["id"]
+    assert claims["key_id"] == api_key["id"]
+
+
+def test_the_exchange_requires_a_key(client):
+    response = client.post("/auth/token")
+    assert response.status_code == 401
+    assert "x-api-key" in response.json()["detail"]
+
+
+def test_the_exchange_rejects_an_unknown_key(client):
+    response = client.post("/auth/token", headers={"x-api-key": "0" * 64})
+    assert response.status_code == 401
+
+
+def test_a_revoked_key_cannot_be_exchanged(client, user, api_key):
+    client.delete(f"/auth/apikeys/{api_key['id']}", headers=user["headers"])
+    response = client.post("/auth/token", headers={"x-api-key": api_key["key"]})
+    assert response.status_code == 401
+
+
+def test_a_dashboard_token_cannot_be_exchanged(client, user):
+    """Only an API key buys a gateway token; a signed-in session does not."""
+    assert client.post("/auth/token", headers=user["headers"]).status_code == 401
+
+
+def test_a_gateway_token_is_not_a_dashboard_token(client, gateway_headers):
+    """It calls the API; it cannot manage the account that owns it."""
+    assert client.get("/auth/me", headers=gateway_headers).status_code == 401
+    assert client.get("/auth/apikeys", headers=gateway_headers).status_code == 401
+
+
+# --------------------------------------------------------------------------
 # Password hashing must not stall the gateway
 # --------------------------------------------------------------------------
 

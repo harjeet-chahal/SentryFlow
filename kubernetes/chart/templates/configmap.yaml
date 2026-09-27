@@ -15,6 +15,7 @@ data:
   rateLimitFailOpen: {{ .Values.config.rateLimitFailOpen | quote }}
   accessTokenExpireMinutes: {{ .Values.config.accessTokenExpireMinutes | quote }}
   refreshTokenExpireDays: {{ .Values.config.refreshTokenExpireDays | quote }}
+  gatewayTokenExpireMinutes: {{ .Values.config.gatewayTokenExpireMinutes | quote }}
   kafkaBootstrapServers: {{ .Values.externalServices.kafkaBootstrapServers | quote }}
   clickhouseHost: {{ .Values.externalServices.clickhouseHost | quote }}
   clickhousePort: {{ .Values.externalServices.clickhousePort | quote }}

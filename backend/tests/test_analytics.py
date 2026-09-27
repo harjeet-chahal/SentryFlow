@@ -210,11 +210,11 @@ def test_clickhouse_outage_is_a_503_not_a_500(client, user, fake_clickhouse):
     assert response.json() == {"detail": "Analytics store unavailable"}
 
 
-def test_analytics_needs_no_api_key(client, user, fake_clickhouse):
-    """The dashboard authenticates with a JWT; the gateway must not demand a key."""
+def test_analytics_is_not_behind_the_gateway(client, user, fake_clickhouse):
+    """The dashboard authenticates with its own JWT, which the gateway would
+    refuse; its routes must not demand a gateway token."""
     response = client.get("/analytics/usage", headers=user["headers"])
     assert response.status_code == 200
-    assert "x-api-key" not in response.text
 
 
 # --------------------------------------------------------------------------

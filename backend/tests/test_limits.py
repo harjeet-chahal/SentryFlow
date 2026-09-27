@@ -180,35 +180,35 @@ def test_deleting_a_missing_rule_is_a_404(client, admin):
 # Changes take effect on the very next request
 # --------------------------------------------------------------------------
 
-def _hello(client, api_key):
-    return client.get("/api/v1/hello", headers={"x-api-key": api_key["key"]})
+def _hello(client, headers):
+    return client.get("/api/v1/hello", headers=headers)
 
 
-def test_lowering_a_limit_applies_immediately(client, admin, user, api_key):
+def test_lowering_a_limit_applies_immediately(client, admin, user, gateway_headers):
     # The first request caches "no rule, use the defaults" for 60 seconds.
-    assert _hello(client, api_key).status_code == 200
+    assert _hello(client, gateway_headers).status_code == 200
 
     client.put("/limits", json=_rule(user["id"], rpm=2), headers=admin["headers"])
 
-    assert _hello(client, api_key).status_code == 200
-    blocked = _hello(client, api_key)
+    assert _hello(client, gateway_headers).status_code == 200
+    blocked = _hello(client, gateway_headers)
     assert blocked.status_code == 429
     assert blocked.headers["X-RateLimit-Limit"] == "2"
 
 
-def test_deleting_a_limit_restores_the_defaults_immediately(client, admin, user, api_key):
+def test_deleting_a_limit_restores_the_defaults_immediately(client, admin, user, gateway_headers):
     rule = client.put("/limits", json=_rule(user["id"], rpm=1), headers=admin["headers"]).json()
-    assert _hello(client, api_key).status_code == 200
-    assert _hello(client, api_key).status_code == 429
+    assert _hello(client, gateway_headers).status_code == 200
+    assert _hello(client, gateway_headers).status_code == 429
 
     client.delete(f"/limits/{rule['id']}", headers=admin["headers"])
 
-    response = _hello(client, api_key)
+    response = _hello(client, gateway_headers)
     assert response.status_code == 200
     assert response.headers["X-RateLimit-Limit"] == str(settings.DEFAULT_REQUESTS_PER_MINUTE)
 
 
-def test_a_rule_for_one_endpoint_leaves_the_others_alone(client, admin, user, api_key):
+def test_a_rule_for_one_endpoint_leaves_the_others_alone(client, admin, user, gateway_headers):
     client.put("/limits", json=_rule(user["id"], "/api/v1/other", rpm=1), headers=admin["headers"])
-    response = _hello(client, api_key)
+    response = _hello(client, gateway_headers)
     assert response.headers["X-RateLimit-Limit"] == str(settings.DEFAULT_REQUESTS_PER_MINUTE)

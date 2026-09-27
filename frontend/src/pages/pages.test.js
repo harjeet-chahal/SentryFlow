@@ -148,7 +148,10 @@ describe('Dashboard', () => {
     renderDashboard();
 
     expect(await screen.findByText('No traffic in the last 24 hours yet')).toBeInTheDocument();
-    expect(screen.getByText('curl -H "x-api-key: <key>" http://gateway.test/api/v1/hello')).toBeInTheDocument();
+    // The key buys a token at /auth/token; the gateway takes only the token.
+    const example = screen.getByText(/^TOKEN=/);
+    expect(example).toHaveTextContent('-H "x-api-key: <key>" http://gateway.test/auth/token');
+    expect(example).toHaveTextContent('-H "Authorization: Bearer $TOKEN" http://gateway.test/api/v1/hello');
     expect(screen.getByRole('link', { name: 'API Keys' })).toHaveAttribute('href', '/api-keys');
     expect(screen.queryByText('Total requests')).not.toBeInTheDocument();
   });
@@ -379,7 +382,7 @@ describe('LogsExplorer', () => {
     expect(within(rows[1]).getByText('alice')).toBeInTheDocument();
     expect(within(rows[1]).getByText('3 ms')).toBeInTheDocument();
     expect(within(rows[2]).getByText('429')).toBeInTheDocument();
-    // A 429 still reports its gateway time (key lookup and limit check).
+    // A 429 still reports its gateway time (token check and limit check).
     expect(within(rows[2]).getByText('1 ms')).toBeInTheDocument();
 
     await screen.findByRole('option', { name: 'bob' });
@@ -637,6 +640,8 @@ describe('ApiKeys', () => {
     expect(screen.getByText('API key “CI key” created')).toBeInTheDocument();
     expect(screen.getByText(activeKey.key)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Copy key' })).toBeInTheDocument();
+    // The example trades this key for a gateway token.
+    expect(screen.getByText(/^TOKEN=/)).toHaveTextContent(`-H "x-api-key: ${activeKey.key}"`);
   });
 
   test('shows the API error when creating a key fails', async () => {

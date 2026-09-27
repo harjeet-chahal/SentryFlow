@@ -7,8 +7,9 @@
 [![CI](https://github.com/harjeet-chahal/SentryFlow/actions/workflows/ci.yml/badge.svg)](https://github.com/harjeet-chahal/SentryFlow/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-SentryFlow sits in front of an API. It authenticates every call by API key
-and checks it against that caller's per-endpoint rate limit. The limit is
+SentryFlow sits in front of an API. It authenticates every call with a
+short-lived JWT, which a program gets in exchange for its API key, and checks
+the call against that caller's per-endpoint rate limit. The limit is
 enforced atomically in Redis, so it holds across any number of gateway
 replicas. Every call is then streamed through Kafka into ClickHouse. A React
 dashboard shows traffic, latency and throttling seconds after they happen.
@@ -29,19 +30,20 @@ seconds.</sub>
 | Result | Details |
 | --- | --- |
 | **1,500 req/s per worker** | one gateway process, p99 24.9 ms, zero failed requests ([k6](docs/load-testing.md)) |
-| **0.7 ms median overhead** | at 1,000 req/s: API-key lookup, rate-limit check and usage event (p95 1.4 ms) |
+| **0.7 ms median overhead** | at 1,000 req/s: authentication, rate-limit check and usage event (p95 1.4 ms). Measured with API keys; [JWTs add about 0.06 ms](docs/load-testing.md#api-keys-vs-jwts) |
 | **Exactly 30 through** | a caller allowed 30 requests sent over 200; exactly 30 succeeded in every load-test run, with either algorithm |
 | **≤ 2.1 s to analytics** | from a request to its row in the analytics API |
 | **186 bytes vs 4.2 MB** | Redis state for one high-limit caller after 30 s at 1,000 req/s: token bucket vs sliding window |
-| **438 tests** | backend coverage 94.9%, aggregator 99.3%, frontend 80.2%; the analytics SQL runs against a real ClickHouse |
+| **471 tests** | backend coverage 96.0%, aggregator 99.3%, frontend 80.2%; the analytics SQL runs against a real ClickHouse |
 | **6 CI jobs per PR** | tests with coverage floors, SQL against ClickHouse, frontend tests and build, Helm lint and `kubeconform -strict`, image builds |
 
 ---
 
 ## Features
 
-- **Gateway.** Resolves API keys through a Redis cache and rejects bad ones
-  with a `401` before any rate-limit budget is spent. Its responses carry
+- **Gateway.** Checks a JWT on every call: its signature, its expiry, and
+  whether its API key has been revoked since it was issued. A bad token gets
+  a `401` before any rate-limit budget is spent. Responses carry
   `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset`, and
   every `429` a `Retry-After`.
 - **Two rate-limiting algorithms.** The sliding window is exact at the window
@@ -54,9 +56,11 @@ seconds.</sub>
 - **Usage analytics.** Requests, error rate, throttling, average, p95 and p99
   latency, status codes, busiest endpoints, a per-user drill-down and a
   filterable request log, over the last hour, day, week or 30 days.
-- **Two credentials, two roles.** People sign in with JWTs (access and
-  refresh tokens); programs call with API keys. Users see only their own
-  traffic. Admins see everyone's and set the limits.
+- **JWTs for people and for programs.** People sign in for dashboard tokens
+  (access and refresh). Programs trade an API key for a 15-minute gateway
+  token, so the long-lived key is sent once per token rather than with every
+  call. Neither kind of token works in the other's place. Users see only
+  their own traffic. Admins see everyone's and set the limits.
 - **Degrades instead of failing.** If Redis goes down, the limiter fails open
   by default. A Kafka outage loses usage events but never delays requests. If
   ClickHouse goes down, the dashboard loses analytics and the gateway keeps
@@ -73,17 +77,18 @@ flowchart TB
 
     subgraph gw ["Gateway · FastAPI, any number of replicas"]
         direction LR
-        authn["Authenticate<br/>x-api-key → user"] --> limit["Rate limit<br/>one atomic Lua script"] --> serve["Serve"] --> record["Record<br/>queue a usage event"]
+        authn["Authenticate<br/>verify JWT → user"] --> limit["Rate limit<br/>one atomic Lua script"] --> serve["Serve"] --> record["Record<br/>queue a usage event"]
     end
-    dashapi["Dashboard API · same FastAPI app<br/>/auth · /limits · /analytics"]
+    dashapi["Auth and dashboard API · same FastAPI app<br/>/auth · /limits · /analytics"]
 
-    redis[("Redis<br/>limiter state<br/>key and rule caches")]
+    redis[("Redis<br/>limiter state · rule cache<br/>revoked keys")]
     postgres[("PostgreSQL<br/>users · API keys · rules")]
     kafka[["Kafka<br/>api-requests<br/>rate-limited-events"]]
     aggregator["Aggregator<br/>batch: 1,000 events or 2 s"]
     clickhouse[("ClickHouse<br/>one row per request")]
 
-    client -->|"x-api-key"| gw
+    client -->|"API key → JWT"| dashapi
+    client -->|"Bearer JWT"| gw
     gw <--> redis
     gw -. "cache miss" .-> postgres
     gw -->|"background publisher"| kafka
@@ -95,12 +100,17 @@ flowchart TB
 
 ### Request path
 
-This is the synchronous part, the only part a caller waits for.
+This is the synchronous part, the only part a caller waits for. Beforehand,
+a program trades its API key for a gateway token at `POST /auth/token`, and
+again when the token expires 15 minutes later. The key is checked against
+Postgres there, once per token rather than on every call.
 
-1. **Authenticate.** The `x-api-key` header is resolved to a user through
-   Redis. Valid keys are cached for an hour and unknown ones for 60 s, so a
-   flood of bad keys never reaches Postgres. A missing or unknown key gets a
-   `401` here, before it can use up anyone's rate limit.
+1. **Authenticate.** The `Authorization: Bearer` token is verified inside
+   the gateway: its signature, its expiry, and that it is a gateway token.
+   The token names its user, so nothing is looked up. One Redis call checks
+   that its API key has not been revoked since. A missing, invalid or
+   revoked token gets a `401` here, before it can use up anyone's rate
+   limit.
 2. **Rate limit.** The caller's rule for this path is resolved and cached in
    Redis for 60 s. Then one Lua script checks and updates the counter in a
    single atomic step. A caller over the limit gets a `429` with
@@ -110,8 +120,10 @@ This is the synchronous part, the only part a caller waits for.
 4. **Record.** One usage event goes onto a bounded in-memory queue, and the
    response returns. The request never waits on Kafka.
 
-The gateway's whole overhead is three Redis round trips (key, rule, Lua
-script) and a queue put: a 0.7 ms median at 1,000 requests/s.
+The gateway's whole overhead is a signature check, three Redis round trips
+(revocation, rule, Lua script) and a queue put. With the API-key lookup that
+came before JWTs, that measured a 0.7 ms median at 1,000 requests/s; the JWT
+check adds about 0.06 ms.
 
 ### Analytics path
 
@@ -136,7 +148,7 @@ This part is asynchronous; callers never wait on it.
 | Component | Built with | Responsibility |
 | --- | --- | --- |
 | Gateway ([`backend/`](backend)) | Python 3.11, FastAPI, SQLAlchemy, aiokafka | authentication, rate limiting, usage events; also serves the dashboard's API |
-| Limiter state and caches | Redis, Lua | rate-limit counters, API-key cache, rule cache |
+| Limiter state and caches | Redis, Lua | rate-limit counters, rule cache, revoked keys |
 | Accounts | PostgreSQL (SQLite for local runs and tests) | users, API keys, rate-limit rules |
 | Event stream | Kafka in KRaft mode | usage events on two topics |
 | Aggregator ([`aggregator/`](aggregator)) | Python, aiokafka, clickhouse-driver | batches events from Kafka into ClickHouse |
@@ -212,6 +224,10 @@ gateway's own overhead. The method and every run are in
   events added no measurable latency at 1,000 requests/s and about 0.05 ms to
   the median at 1,500. Before the queue, a Kafka outage held each request for
   up to 40 seconds.
+- **JWTs cost about 0.06 ms.** The runs above predate them, when the gateway
+  looked each API key up in Redis. Run before and after, alternately, at
+  1,000 requests/s, the JWT build's median was 0.06–0.07 ms higher, and p95
+  and p99 stayed within run-to-run noise. Throttling stayed exact.
 
 ---
 
@@ -265,8 +281,12 @@ KEY=$(curl -s -X POST localhost:8000/auth/apikeys/create \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"name":"demo-key"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["key"])')
 
-# 3. Call through the gateway
-curl -i localhost:8000/api/v1/hello -H "x-api-key: $KEY"
+# 3. Trade the key for a gateway token (valid for 15 minutes)
+GATEWAY_TOKEN=$(curl -s -X POST localhost:8000/auth/token -H "x-api-key: $KEY" \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["access_token"])')
+
+# 4. Call through the gateway
+curl -i localhost:8000/api/v1/hello -H "Authorization: Bearer $GATEWAY_TOKEN"
 ```
 
 The response carries `X-RateLimit-Limit`, `X-RateLimit-Remaining` and
@@ -289,11 +309,11 @@ make test-integration         # analytics SQL; needs a ClickHouse, e.g. the comp
 
 | Suite | Tests | Coverage |
 | --- | ---: | ---: |
-| Backend | 292 | **94.9%** of statements and branches (CI fails below 90%) |
+| Backend | 325 | **96.0%** of statements and branches (CI fails below 90%) |
 | Analytics SQL, against a real ClickHouse | 11 | — |
 | Aggregator | 32 | **99.3%** (CI fails below 90%) |
 | Frontend | 103 | 80.2% of statements, 74.5% of branches |
-| **Total** | **438** | |
+| **Total** | **471** | |
 
 The unit suites need no running services. Postgres is replaced by SQLite, and
 Redis by `fakeredis`, which runs the real Lua scripts, so the limiter
@@ -313,10 +333,13 @@ Beyond the happy paths, the suites cover:
 - token-bucket refill, and the cap at the bucket's capacity;
 - failing open, and failing closed, when Redis is down;
 - refresh tokens rejected as access tokens, and forged or expired tokens;
+- gateway and dashboard tokens each refused in the other's place, and
+  unsigned (`alg: none`) tokens refused;
 - per-user data scoping and admin-only writes;
 - paging through users without loading every account;
 - a changed limit applying on the very next request;
-- a revoked key being evicted from the cache;
+- a revoked key's tokens failing on the very next request, even with Redis
+  down;
 - a stalled Kafka broker not slowing callers, and reconnecting to a Kafka that
   starts late;
 - the aggregator committing offsets only after its writes (at-least-once);
@@ -375,19 +398,30 @@ and would be the wrong one for billing.
 **The limiter fails open.** If Redis is unreachable, requests are served
 without enforcement (`RATE_LIMIT_FAIL_OPEN`, default `true`). Losing the rate
 limiter should degrade enforcement, not cause an API outage. Authentication,
-by contrast, never fails open: a cache outage makes it query the database on
-every request, which is slower but still correct.
+by contrast, never fails open: if Redis cannot answer the revocation check,
+the gateway asks the database whether the token's key is still active, which
+is slower but still correct.
 
 **No secrets in source.** The JWT signing key is read from the environment.
 When `ENVIRONMENT=production` and `JWT_SECRET` is unset, the application
 refuses to boot rather than fall back to a default. In development it
 generates a temporary key.
 
-**Revocation evicts the cache.** API keys are cached for an hour, so
-deactivating the database row alone would leave a revoked key working until
-the cache entry expired. Revoking a key also evicts it from the cache.
-Changing or deleting a rate-limit rule does the same for the cached rule, so
-new limits apply on the next request.
+**Gateway calls carry a short-lived JWT, not the API key.** A program
+trades its key for a 15-minute token at `/auth/token`. The long-lived secret
+then crosses the network once per token rather than with every call, and a
+token that leaks is good for minutes. The token names its user and is
+verified in-process, so authenticating a request needs no database lookup and
+no cache of keys. Dashboard tokens are signed with the same key; a `type`
+claim keeps each kind out of the other's routes.
+
+**Revocation and limit changes apply on the next request.** A JWT cannot be
+withdrawn before it expires. So revoking a key also records its id in Redis
+for as long as its tokens could still be valid, and the gateway checks that
+list on every call. The check is one Redis round trip, the one the old
+per-request key lookup used. If Redis loses the list, a revoked key's tokens
+keep working until they expire, 15 minutes at most. Changing or deleting a
+rate-limit rule likewise evicts the cached rule.
 
 **Operators set limits, customers do not.** Anyone can read the limits that
 apply to them, but only admins can change them; a customer who could raise
@@ -414,9 +448,9 @@ event loop.
 backend/            FastAPI gateway and dashboard API
   main.py             the middleware chain: authenticate → rate limit → serve → record
   limiter/            Lua scripts, rule resolution, the /limits API
-  middlewares/        API-key lookup, the Kafka usage publisher
+  middlewares/        gateway tokens and revocation, the Kafka usage publisher
   analytics/          ClickHouse queries behind /analytics
-  auth/               sign-up, JWT login, API keys, user directory
+  auth/               sign-up, JWT login, API keys and the token exchange, user directory
   health_check.py     /health, /health/ready, /health/live
 aggregator/         Kafka → ClickHouse batch consumer, and the table schema
 frontend/           React dashboard, served by nginx

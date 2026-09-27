@@ -46,7 +46,9 @@ class Settings:
     JWT_ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
     ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
     REFRESH_TOKEN_EXPIRE_DAYS: int = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
-    API_KEY_CACHE_TTL: int = int(os.getenv("API_KEY_CACHE_TTL", "3600"))
+    # Lifetime of the tokens programs get for their API keys and present to
+    # the gateway. Also how long a revocation has to be remembered.
+    GATEWAY_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("GATEWAY_TOKEN_EXPIRE_MINUTES", "15"))
 
     # Rate limiting defaults, used when a user has no per-endpoint override
     DEFAULT_REQUESTS_PER_MINUTE: int = int(os.getenv("DEFAULT_RATE_LIMIT", "60"))

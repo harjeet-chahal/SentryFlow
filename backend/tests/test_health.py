@@ -65,10 +65,10 @@ def test_health_is_degraded_not_unhealthy_without_kafka(client):
     assert body["components"]["kafka"]["detail"] == "Connecting to Kafka"
 
 
-def test_health_reports_usage_events_kafka_refused(client, api_key, fake_kafka, published):
+def test_health_reports_usage_events_kafka_refused(client, gateway_headers, fake_kafka, published):
     """Connected is not enough: a broker that stops taking events is degraded too."""
     fake_kafka.fail = True
-    client.get("/api/v1/hello", headers={"x-api-key": api_key["key"]})
+    client.get("/api/v1/hello", headers=gateway_headers)
     published()
 
     body = client.get("/health").json()

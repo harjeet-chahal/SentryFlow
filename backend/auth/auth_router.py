@@ -1,11 +1,14 @@
 """User authentication and API-key management.
 
-Two distinct credentials live here and they are not interchangeable:
+Three credentials live here, and none is accepted in another's place:
 
-    JWT           Identifies a human operating the dashboard. Short-lived,
-                  refreshed via /auth/refresh.
-    API key       Identifies a machine calling through the gateway. Long-lived,
-                  revocable, and the thing the rate limiter keys on.
+    Dashboard JWT   Identifies a person operating the dashboard. Short-lived,
+                    refreshed via /auth/refresh.
+    API key         Identifies a program. Long-lived and revocable, and sent
+                    only to /auth/token.
+    Gateway JWT     What a program presents to the gateway, issued by
+                    /auth/token for an API key. Short-lived; the rate limiter
+                    keys on the user it names.
 """
 import logging
 import secrets
@@ -13,9 +16,9 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Security, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import APIKeyHeader, OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -23,6 +26,7 @@ from sqlalchemy.orm import Session
 from backend.auth.schemas import (
     ApiKeyCreate,
     ApiKeyResponse,
+    GatewayTokenResponse,
     RefreshRequest,
     TokenResponse,
     UserCreate,
@@ -30,7 +34,11 @@ from backend.auth.schemas import (
     UserResponse,
 )
 from backend.config import JWT_SECRET, settings
-from backend.middlewares.auth_middleware import invalidate_api_key
+from backend.middlewares.auth_middleware import (
+    issue_gateway_token,
+    revoke_gateway_tokens,
+    verify_api_key,
+)
 from backend.models.database import SessionLocal
 from backend.models.models import ApiKey, User
 
@@ -44,10 +52,14 @@ router = APIRouter()
 # event loop they would stall every in-flight gateway request.
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+# A security scheme rather than a plain header, so Swagger's Authorize dialog
+# can send it.
+api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
-# Distinguishes the two token flavours. Without this claim a refresh token
-# would be accepted as an access token, silently extending its privileges to
-# every authenticated route.
+# Distinguishes the dashboard's two token flavours; gateway tokens are a third
+# (see auth_middleware). Without this claim a refresh token would be accepted
+# as an access token, silently extending its privileges to every
+# authenticated route.
 ACCESS_TOKEN_TYPE = "access"
 REFRESH_TOKEN_TYPE = "refresh"
 
@@ -245,18 +257,18 @@ def list_api_keys(
     return db.query(ApiKey).filter(ApiKey.user_id == current_user.id).all()
 
 
-def _deactivate_api_key(db: Session, api_key_id: str, user_id: str) -> Optional[str]:
-    """Deactivate one of a user's keys. Returns the key, or None if not theirs."""
+def _deactivate_api_key(db: Session, api_key_id: str, user_id: str) -> bool:
+    """Deactivate one of a user's keys. Returns False if it is not theirs."""
     record = (
         db.query(ApiKey)
         .filter(ApiKey.id == api_key_id, ApiKey.user_id == user_id)
         .first()
     )
     if record is None:
-        return None
+        return False
     record.is_active = False
     db.commit()
-    return record.key
+    return True
 
 
 @router.delete("/apikeys/{api_key_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -265,17 +277,40 @@ async def revoke_api_key(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Revoke a key and evict it from the gateway's cache.
+    """Revoke a key and cancel the gateway tokens issued for it.
 
-    Deactivating the row alone is not enough: the gateway caches resolved
-    keys for an hour, so a revoked key would keep working until that expired.
+    Deactivating the row stops new tokens being issued, but not the ones
+    already out there, which would keep working until they expired.
+    Recording the revocation where the gateway checks stops them on their
+    next request.
     """
-    key = await run_in_threadpool(_deactivate_api_key, db, api_key_id, current_user.id)
-    if key is None:
+    found = await run_in_threadpool(_deactivate_api_key, db, api_key_id, current_user.id)
+    if not found:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="API key not found")
 
-    await invalidate_api_key(key)
+    await revoke_gateway_tokens(api_key_id)
     return None
+
+
+@router.post("/token", response_model=GatewayTokenResponse)
+async def exchange_api_key(api_key: Optional[str] = Security(api_key_header)):
+    """Trade an API key for a short-lived gateway token.
+
+    The key is the long-lived secret, and this is the only place it is
+    sent. Gateway requests carry the token instead, so a token that leaks is
+    good for minutes rather than for as long as the key lives.
+    """
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing API key. Supply it in the x-api-key header.",
+        )
+    key = await verify_api_key(api_key)
+    if key is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or revoked API key."
+        )
+    return issue_gateway_token(key)
 
 
 @router.get("/me", response_model=UserResponse)

@@ -1,6 +1,7 @@
 import React, { useCallback, useMemo, useState } from 'react';
-import { useAuth, publicApiUrl } from '../components/auth/AuthContext';
+import { useAuth } from '../components/auth/AuthContext';
 import CopyButton from '../components/CopyButton';
+import GatewayCurlExample from '../components/GatewayCurlExample';
 import { PageHeader, PageSpinner, ErrorState, Badge } from '../components/ui';
 import { formatDateTime, formatRelative, maskKey, parseApiDate } from '../utils/analytics';
 import { getJson, apiErrorMessage } from '../utils/api';
@@ -33,9 +34,7 @@ const NewKeyBanner = ({ apiKey, onDismiss }) => (
       <CopyButton text={apiKey.key} label="Copy key" />
     </div>
     <p className="mt-3 text-sm text-green-700">Try it:</p>
-    <pre className="mt-1 overflow-x-auto rounded-md bg-gray-900 p-3 text-xs text-gray-100">
-      <code>{`curl -H "x-api-key: ${apiKey.key}" ${publicApiUrl('/api/v1/hello')}`}</code>
-    </pre>
+    <GatewayCurlExample apiKey={apiKey.key} className="mt-1" />
     <button
       type="button"
       className="mt-3 text-sm font-medium text-green-800 hover:text-green-700"
@@ -88,7 +87,7 @@ const ApiKeys = () => {
   // Revoke an API key (the row stays, marked as revoked)
   const handleRevoke = async (apiKey) => {
     const confirmed = window.confirm(
-      `Revoke “${apiKey.name}”? Requests using this key will be rejected immediately. This can't be undone.`
+      `Revoke “${apiKey.name}”? Tokens issued for it stop working immediately. This can't be undone.`
     );
     if (!confirmed) return;
 
@@ -112,7 +111,12 @@ const ApiKeys = () => {
     <div className="space-y-6">
       <PageHeader
         title="API Keys"
-        subtitle={<span>Send a key in the x-api-key header to call the API through the gateway.</span>}
+        subtitle={
+          <span>
+            Trade a key for a short-lived token at /auth/token, then send the token to call the API
+            through the gateway.
+          </span>
+        }
       />
 
       {/* Create new API key form */}

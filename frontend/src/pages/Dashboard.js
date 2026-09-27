@@ -1,6 +1,7 @@
 import React, { useCallback, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { useAuth, publicApiUrl } from '../components/auth/AuthContext';
+import { useAuth } from '../components/auth/AuthContext';
+import GatewayCurlExample from '../components/GatewayCurlExample';
 import TimeRangePicker from '../components/TimeRangePicker';
 import { PageHeader, PageSpinner, ErrorState, LiveIndicator, ChartCard } from '../components/ui';
 import {
@@ -33,10 +34,8 @@ const NoTrafficYet = ({ rangeText, isAdmin }) => (
         page.
       </li>
       <li>
-        Send a request through the gateway with it:
-        <pre className="mt-2 overflow-x-auto rounded-md bg-gray-900 p-3 text-xs text-gray-100">
-          <code>{`curl -H "x-api-key: <key>" ${publicApiUrl('/api/v1/hello')}`}</code>
-        </pre>
+        Trade it for a token and send a request through the gateway:
+        <GatewayCurlExample apiKey="<key>" className="mt-2" />
       </li>
     </ol>
     <p className="mt-4 text-sm text-gray-500">Already sent some? Try a longer time range.</p>
