@@ -2,7 +2,7 @@
 
 # SentryFlow
 
-**API gateway with distributed rate limiting and real-time usage analytics.**
+**A self-hosted API gateway with rate limiting, request logging and usage analytics**
 
 [![CI](https://github.com/harjeet-chahal/SentryFlow/actions/workflows/ci.yml/badge.svg)](https://github.com/harjeet-chahal/SentryFlow/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
