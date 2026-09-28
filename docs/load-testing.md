@@ -42,12 +42,61 @@ The full k6 summary is also written to `loadtest/results/summary.json`
 
 ## Results
 
-Measured on 2026-09-24 against the compose stack: one gateway process (a
-single uvicorn worker), Redis, Kafka, ClickHouse and Postgres all in Docker
-Desktop on an Apple M4 Pro (12 CPUs, 7.6 GB given to Docker). Latency is
-client-observed through the gateway, for the steady scenario only. These runs,
-and the comparisons below them, authenticated with API keys; what JWTs cost
-instead is under [API keys vs JWTs](#api-keys-vs-jwts).
+Measured on 2026-09-27 against the compose stack at `fb31636`, with JWT
+authentication and usage events queued for a background Kafka publisher: one
+gateway process (a single uvicorn worker), Redis, Kafka, ClickHouse and
+Postgres all in Docker Desktop on an Apple M4 Pro (12 CPUs, 7.6 GB given to
+Docker). The macOS Bluetooth daemon used about one core throughout. Latency is
+client-observed through the gateway, for the steady scenario only. Rows are in
+the order they ran; at 1,000/s the two algorithms took turns, twice each.
+
+| Offered rate | Algorithm | Requests | Median | p95 | p99 | Max | Failures |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 200/s, 60 s | sliding window | 12,001 | 1.49 ms | 2.64 ms | 4.25 ms | 50 ms | 0 |
+| 500/s, 30 s | sliding window | 15,001 | 0.93 ms | 1.31 ms | 1.87 ms | 12 ms | 0 |
+| 1,000/s, 30 s | sliding window | 30,000 | 0.68 ms | 1.29 ms | 2.85 ms | 50 ms | 0 |
+| 1,000/s, 30 s | token bucket | 30,002 | 0.80 ms | 1.87 ms | 5.79 ms | 35 ms | 0 |
+| 1,000/s, 30 s | sliding window | 30,003 | 0.93 ms | 1.88 ms | 4.42 ms | 54 ms | 0 |
+| 1,000/s, 30 s | token bucket | 30,001 | 0.64 ms | 1.18 ms | 2.75 ms | 35 ms | 0 |
+| 1,250/s, 30 s | sliding window | 37,501 | 0.76 ms | 1.91 ms | 6.08 ms | 62 ms | 0 |
+| 1,500/s, 30 s | sliding window | 45,001 | 0.76 ms | 2.82 ms | 10.5 ms | 48 ms | 0 |
+| 2,000/s, 30 s | sliding window | 46,757 served, 13,255 not sent | 0.32 s | 4.0 s | 4.7 s | 5.3 s | 0 |
+
+In every run the throttled caller got **exactly 30** successful responses out
+of 215–226, and both token-bucket runs passed the refill check exactly: 10,
+then 5. Below saturation, new events showed up in the analytics API within
+**0.6–2.2 s**, bounded by the aggregator's 2-second flush interval. At 2,000/s
+the freshness check never started: signing up its user timed out.
+
+### Reading the numbers
+
+- **One worker holds p99 under 11 ms up to 1,500 requests/s**, and saturates
+  somewhere between 1,500 and 2,000. At 2,000/s requests queue, latency climbs
+  into seconds, and k6 could not send 13,255 requests. The gateway's event
+  queue filled and dropped 9,444 usage events rather than hold requests, as
+  designed. That is the point to add pods: the Helm chart's HPA scales the
+  gateway from 3 to 12 replicas, and all replicas share one Redis, so limits
+  hold across them.
+- **The two algorithms cost the same.** Their medians at 1,000/s overlap:
+  0.68 and 0.93 ms for the sliding window, 0.80 and 0.64 ms for the token
+  bucket. Their memory does not. After a 30 s run at 1,000/s, the busy
+  caller's sliding-window key held 4.0 MB and its token-bucket key 170 bytes.
+  The sliding window's key grows with traffic: 6.2 MB after 30 s at 1,500/s.
+- **This measures gateway overhead, not a backend.** `/api/v1/hello` does no
+  work, so the time is the gateway itself: a JWT signature check, three Redis
+  round trips (the revocation check, the cached rule lookup and the Lua
+  limiter script) and queueing an event for the Kafka publisher.
+  A proxied upstream adds its own latency on top.
+- **It is a laptop, not AWS.** There is no network hop, TLS or load balancer
+  between k6 and the gateway, and every dependency shares the same machine.
+  Treat the absolute numbers as the gateway's own cost, and the curve as the
+  useful part.
+
+### Earlier runs
+
+The first published runs, on 2026-09-24, authenticated with API keys and
+awaited Kafka inside each request; the sections below price both changes.
+Same laptop and stack, one sliding-window run per rate:
 
 | Offered rate | Requests | Median | p95 | p99 | Max | Failures |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -58,26 +107,8 @@ instead is under [API keys vs JWTs](#api-keys-vs-jwts).
 | 1,500/s, 30 s | 45,001 | 0.8 ms | 3.0 ms | 24.9 ms | 72 ms | 0 |
 | 2,000/s, 30 s | 22,064 served, 37,941 not sent | 1.7 s | 13.4 s | 13.8 s | 14.2 s | 0 |
 
-In every run the throttled caller got **exactly 30** successful responses out
-of ~225, and new events showed up in the analytics API within **0.1–2.1 s**,
-bounded by the aggregator's 2-second flush interval.
-
-### Reading the numbers
-
-- **One worker holds p99 under 25 ms up to 1,500 requests/s**, and saturates
-  somewhere between 1,500 and 2,000. At 2,000/s requests queue, latency climbs
-  into seconds, and k6 cannot send the rest. That is the point to add pods: the
-  Helm chart's HPA scales the gateway from 3 to 12 replicas, and all replicas
-  share one Redis, so limits hold across them.
-- **This measures gateway overhead, not a backend.** `/api/v1/hello` does no
-  work, so the time is the gateway itself: three Redis round trips
-  (authentication, the cached rule lookup and the Lua limiter script) and
-  queueing an event for the Kafka publisher.
-  A proxied upstream adds its own latency on top.
-- **It is a laptop, not AWS.** There is no network hop, TLS or load balancer
-  between k6 and the gateway, and every dependency shares the same machine.
-  Treat the absolute numbers as the gateway's own cost, and the curve as the
-  useful part.
+The throttled caller got exactly 30 successes out of ~225 in every run, and
+new events reached the analytics API within 0.1–2.1 s.
 
 ### What the first run found
 
@@ -92,14 +123,14 @@ fails if either call moves back onto the loop.
 
 ### The cost of queueing usage events
 
-The table above predates usage events moving onto an in-memory queue, which
-a background task publishes to Kafka (see [analytics](analytics.md)). The
+The 2026-09-24 runs predate usage events moving onto an in-memory queue,
+which a background task publishes to Kafka (see [analytics](analytics.md)). The
 queue adds one task switch per event. To price that, the steady scenario ran
 on its own against the code before and after the change, alternating, on the
 same laptop: the gateway under uvicorn on the host, with Redis and Kafka in
 Docker, and k6 in Docker reaching the host through Docker Desktop. That path
 differs from the compose network, so compare these rows with each other, not
-with the table.
+with the tables above.
 
 | Offered rate | Code | Median | p95 | p99 |
 | ---: | --- | ---: | ---: | ---: |
@@ -115,8 +146,8 @@ for up to 40 seconds.
 
 ### Sliding window vs token bucket
 
-Measured on 2026-09-27 against the compose stack with the current code, on
-the same laptop as above. Each run's callers used one algorithm, set with
+Measured on 2026-09-27 against the compose stack, before the switch to JWTs,
+on the same laptop as above. Each run's callers used one algorithm, set with
 `ALGORITHM`. The algorithms took turns, twice each at every rate, so both saw
 the same conditions. The machine was busier than on 2026-09-24: iCloud Drive
 sync and the Bluetooth daemon used about three cores throughout. That noise
