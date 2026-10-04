@@ -1,0 +1,17 @@
+[run]
+source = backend
+branch = True
+omit =
+    */tests/*
+    */__init__.py
+
+[report]
+# Measure the application, not the test code or unreachable entrypoints.
+exclude_also =
+    if __name__ == .__main__.:
+    if TYPE_CHECKING:
+    raise NotImplementedError
+show_missing = True
+precision = 1
+# The suite is the evidence for the coverage claim; keep it honest.
+fail_under = 90

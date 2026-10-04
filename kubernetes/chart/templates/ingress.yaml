@@ -1,0 +1,41 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "sentryflow.fullname" . }}
+  labels:
+    {{- include "sentryflow.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          # Gateway and dashboard APIs to the backend; everything else to the
+          # SPA. Prefix matching is per path segment: /limits covers /limits
+          # and /limits/<id>, not /limitsx.
+          {{- range list "/api" "/auth" "/health" "/analytics" "/limits" }}
+          - path: {{ . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "sentryflow.fullname" $ }}-backend
+                port:
+                  number: {{ $.Values.service.backendPort }}
+          {{- end }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "sentryflow.fullname" . }}-frontend
+                port:
+                  number: {{ .Values.service.frontendPort }}
+{{- end }}

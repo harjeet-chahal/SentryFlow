@@ -1,0 +1,88 @@
+{{- if .Values.aggregator.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sentryflow.fullname" . }}-aggregator
+  labels:
+    {{- include "sentryflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: aggregator
+spec:
+  # Kafka consumer group: replicas beyond the partition count sit idle, so
+  # this scales with partitions rather than with CPU.
+  replicas: {{ .Values.aggregator.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "sentryflow.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: aggregator
+  strategy:
+    # Recreate rather than RollingUpdate: overlapping consumers trigger an
+    # extra group rebalance for no benefit.
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "sentryflow.labels" . | nindent 8 }}
+        app.kubernetes.io/component: aggregator
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "sentryflow.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: aggregator
+          image: {{ include "sentryflow.image" (list . .Values.aggregator.image.repository) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "sentryflow.fullname" . }}-config
+                  key: kafkaBootstrapServers
+            - name: CLICKHOUSE_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "sentryflow.fullname" . }}-config
+                  key: clickhouseHost
+            - name: CLICKHOUSE_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "sentryflow.fullname" . }}-config
+                  key: clickhousePort
+            - name: CLICKHOUSE_DATABASE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "sentryflow.fullname" . }}-config
+                  key: clickhouseDatabase
+            - name: CLICKHOUSE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sentryflow.secretName" . }}
+                  key: clickhouseUser
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sentryflow.secretName" . }}
+                  key: clickhousePassword
+            # Used only if the topics do not exist yet and the broker lets
+            # the aggregator create them.
+            - name: KAFKA_TOPIC_PARTITIONS
+              value: {{ .Values.aggregator.topicPartitions | quote }}
+            - name: KAFKA_TOPIC_REPLICATION
+              value: {{ .Values.aggregator.topicReplication | quote }}
+          resources:
+            {{- toYaml .Values.aggregator.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
